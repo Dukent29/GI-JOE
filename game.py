@@ -1,170 +1,321 @@
 """
-Snake Eater
-Made with PyGame
+Snake AI
+Made with PyGame and PyTorch
 """
 
-import pygame, sys, time, random
+import pygame
+import sys
+import time
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
 
 
-# Difficulty settings
-# Easy      ->  10
-# Medium    ->  25
-# Hard      ->  40
-# Harder    ->  60
-# Impossible->  120
-difficulty = 25
+# --- Hyperparamètres ---
+difficulty = 25  # Vitesse du jeu
+max_memory_size = 100000
+batch_size = 1000
+gamma = 0.9  # Facteur d'escompte
+epsilon = 1  # Taux d'exploration initial
+epsilon_decay = 0.995
+min_epsilon = 0.01
+learning_rate = 0.001
+target_update = 10  # Fréquence de mise à jour du réseau cible
 
-# Window size
+# --- Dimensions de la fenêtre ---
 frame_size_x = 720
 frame_size_y = 480
 
-# Checks for errors encountered
-check_errors = pygame.init()
-# pygame.init() example output -> (6, 0)
-# second number in tuple gives number of errors
-if check_errors[1] > 0:
-    print(f'[!] Had {check_errors[1]} errors when initialising game, exiting...')
-    sys.exit(-1)
-else:
-    print('[+] Game successfully initialised')
-
-
-# Initialise game window
-pygame.display.set_caption('Snake Eater')
+# --- Initialisation de Pygame ---
+pygame.init()
+pygame.display.set_caption('Snake AI')
 game_window = pygame.display.set_mode((frame_size_x, frame_size_y))
 
-
-# Colors (R, G, B)
+# --- Couleurs ---
 black = pygame.Color(0, 0, 0)
 white = pygame.Color(255, 255, 255)
 red = pygame.Color(255, 0, 0)
 green = pygame.Color(0, 255, 0)
-blue = pygame.Color(0, 0, 255)
 
-
-# FPS (frames per second) controller
+# --- Contrôleur FPS ---
 fps_controller = pygame.time.Clock()
 
+# --- Classes pour le DQN ---
+class DQNAgent:
+    def __init__(self):
+        self.memory = deque(maxlen=max_memory_size)
+        self.epsilon = epsilon
+        self.model = self.build_model()
+        self.target_model = self.build_model()
+        self.update_target_model()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.criterion = nn.MSELoss()
+        self.n_games = 0
+        self.reward_total = 0
 
-# Game variables
-snake_pos = [100, 50]
-snake_body = [[100, 50], [100-10, 50], [100-(2*10), 50]]
+    def build_model(self):
+        # Réseau de neurones simple
+        model = nn.Sequential(
+            nn.Linear(11, 256),
+            nn.ReLU(),
+            nn.Linear(256, 3)  # Modifié de 4 à 3
+        )
+        return model
 
-food_pos = [random.randrange(1, (frame_size_x//10)) * 10, random.randrange(1, (frame_size_y//10)) * 10]
-food_spawn = True
+    def update_target_model(self):
+        self.target_model.load_state_dict(self.model.state_dict())
 
-direction = 'RIGHT'
-change_to = direction
+    def get_state(self, game):
+        # État du jeu sous forme de tableau binaire
+        head = game.snake_pos
+        point_l = [head[0] - 10, head[1]]
+        point_r = [head[0] + 10, head[1]]
+        point_u = [head[0], head[1] - 10]
+        point_d = [head[0], head[1] + 10]
 
-score = 0
+        dir_l = game.direction == 'LEFT'
+        dir_r = game.direction == 'RIGHT'
+        dir_u = game.direction == 'UP'
+        dir_d = game.direction == 'DOWN'
 
+        state = [
+            # Danger tout droit
+            (dir_r and game.is_collision(point_r)) or
+            (dir_l and game.is_collision(point_l)) or
+            (dir_u and game.is_collision(point_u)) or
+            (dir_d and game.is_collision(point_d)),
 
-# Game Over
-def game_over():
-    my_font = pygame.font.SysFont('times new roman', 90)
-    game_over_surface = my_font.render('YOU DIED', True, red)
-    game_over_rect = game_over_surface.get_rect()
-    game_over_rect.midtop = (frame_size_x/2, frame_size_y/4)
-    game_window.fill(black)
-    game_window.blit(game_over_surface, game_over_rect)
-    show_score(0, red, 'times', 20)
-    pygame.display.flip()
-    time.sleep(3)
-    pygame.quit()
-    sys.exit()
+            # Danger à droite
+            (dir_u and game.is_collision(point_r)) or
+            (dir_d and game.is_collision(point_l)) or
+            (dir_l and game.is_collision(point_u)) or
+            (dir_r and game.is_collision(point_d)),
 
+            # Danger à gauche
+            (dir_d and game.is_collision(point_r)) or
+            (dir_u and game.is_collision(point_l)) or
+            (dir_r and game.is_collision(point_u)) or
+            (dir_l and game.is_collision(point_d)),
 
-# Score
-def show_score(choice, color, font, size):
-    score_font = pygame.font.SysFont(font, size)
-    score_surface = score_font.render('Score : ' + str(score), True, color)
-    score_rect = score_surface.get_rect()
-    if choice == 1:
-        score_rect.midtop = (frame_size_x/10, 15)
-    else:
-        score_rect.midtop = (frame_size_x/2, frame_size_y/1.25)
-    game_window.blit(score_surface, score_rect)
-    # pygame.display.flip()
+            # Direction de mouvement
+            dir_l,
+            dir_r,
+            dir_u,
+            dir_d,
 
+            # Nourriture à gauche
+            game.food_pos[0] < game.snake_pos[0],
+            # Nourriture à droite
+            game.food_pos[0] > game.snake_pos[0],
+            # Nourriture en haut
+            game.food_pos[1] < game.snake_pos[1],
+            # Nourriture en bas
+            game.food_pos[1] > game.snake_pos[1]
+        ]
 
-# Main logic
-while True:
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            pygame.quit()
-            sys.exit()
-        # Whenever a key is pressed down
-        elif event.type == pygame.KEYDOWN:
-            # W -> Up; S -> Down; A -> Left; D -> Right
-            if event.key == pygame.K_UP or event.key == ord('w'):
-                change_to = 'UP'
-            if event.key == pygame.K_DOWN or event.key == ord('s'):
-                change_to = 'DOWN'
-            if event.key == pygame.K_LEFT or event.key == ord('a'):
-                change_to = 'LEFT'
-            if event.key == pygame.K_RIGHT or event.key == ord('d'):
-                change_to = 'RIGHT'
-            # Esc -> Create event to quit the game
-            if event.key == pygame.K_ESCAPE:
-                pygame.event.post(pygame.event.Event(pygame.QUIT))
+        return np.array(state, dtype=int)
 
-    # Making sure the snake cannot move in the opposite direction instantaneously
-    if change_to == 'UP' and direction != 'DOWN':
-        direction = 'UP'
-    if change_to == 'DOWN' and direction != 'UP':
-        direction = 'DOWN'
-    if change_to == 'LEFT' and direction != 'RIGHT':
-        direction = 'LEFT'
-    if change_to == 'RIGHT' and direction != 'LEFT':
-        direction = 'RIGHT'
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
 
-    # Moving the snake
-    if direction == 'UP':
-        snake_pos[1] -= 10
-    if direction == 'DOWN':
-        snake_pos[1] += 10
-    if direction == 'LEFT':
-        snake_pos[0] -= 10
-    if direction == 'RIGHT':
-        snake_pos[0] += 10
+    def act(self, state):
+        if random.uniform(0, 1) < self.epsilon:
+            return random.randint(0, 2)  # Modifié de 3 à 2
+        state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0)
+        prediction = self.model(state0)
+        return torch.argmax(prediction).item()
 
-    # Snake body growing mechanism
-    snake_body.insert(0, list(snake_pos))
-    if snake_pos[0] == food_pos[0] and snake_pos[1] == food_pos[1]:
-        score += 1
-        food_spawn = False
-    else:
-        snake_body.pop()
+    def replay(self):
+        if len(self.memory) < batch_size:
+            return
+        minibatch = random.sample(self.memory, batch_size)
+        states, actions, rewards, next_states, dones = zip(*minibatch)
 
-    # Spawning food on the screen
-    if not food_spawn:
-        food_pos = [random.randrange(1, (frame_size_x//10)) * 10, random.randrange(1, (frame_size_y//10)) * 10]
-    food_spawn = True
+        states = torch.tensor(np.array(states), dtype=torch.float)
+        actions = torch.tensor(actions, dtype=torch.long)
+        rewards = torch.tensor(rewards, dtype=torch.float)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float)
+        dones = torch.tensor(dones, dtype=torch.bool)
 
-    # GFX
-    game_window.fill(black)
-    for pos in snake_body:
-        # Snake body
-        # .draw.rect(play_surface, color, xy-coordinate)
-        # xy-coordinate -> .Rect(x, y, size_x, size_y)
-        pygame.draw.rect(game_window, green, pygame.Rect(pos[0], pos[1], 10, 10))
+        # Q valeurs actuelles
+        pred = self.model(states)
+        target = pred.clone()
+        for idx in range(len(dones)):
+            Q_new = rewards[idx]
+            if not dones[idx]:
+                Q_new = rewards[idx] + gamma * torch.max(self.target_model(next_states[idx]))
+            target[idx][actions[idx]] = Q_new
 
-    # Snake food
-    pygame.draw.rect(game_window, white, pygame.Rect(food_pos[0], food_pos[1], 10, 10))
+        self.optimizer.zero_grad()
+        loss = self.criterion(pred, target)
+        loss.backward()
+        self.optimizer.step()
 
-    # Game Over conditions
-    # Getting out of bounds
-    if snake_pos[0] < 0 or snake_pos[0] > frame_size_x-10:
-        game_over()
-    if snake_pos[1] < 0 or snake_pos[1] > frame_size_y-10:
-        game_over()
-    # Touching the snake body
-    for block in snake_body[1:]:
-        if snake_pos[0] == block[0] and snake_pos[1] == block[1]:
-            game_over()
+    def train_short_memory(self, state, action, reward, next_state, done):
+        state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0)
+        next_state0 = torch.tensor(next_state, dtype=torch.float).unsqueeze(0)
+        target = self.model(state0)
+        Q_new = reward
+        if not done:
+            Q_new = reward + gamma * torch.max(self.target_model(next_state0))
+        target[0][action] = Q_new
 
-    show_score(1, white, 'consolas', 20)
-    # Refresh game screen
-    pygame.display.update()
-    # Refresh rate
-    fps_controller.tick(difficulty)
+        self.optimizer.zero_grad()
+        loss = self.criterion(self.model(state0), target)
+        loss.backward()
+        self.optimizer.step()
+
+# --- Classe du jeu ---
+class SnakeGameAI:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.snake_pos = [frame_size_x / 2, frame_size_y / 2]
+        self.snake_body = [self.snake_pos[:], [self.snake_pos[0] - 10, self.snake_pos[1]], [self.snake_pos[0] - 20, self.snake_pos[1]]]
+        self.food_pos = [random.randrange(1, (frame_size_x // 10)) * 10,
+                         random.randrange(1, (frame_size_y // 10)) * 10]
+        self.food_spawn = True
+        self.direction = 'RIGHT'
+        self.score = 0
+        self.frame_iteration = 0
+
+    def is_collision(self, point=None):
+        if point is None:
+            point = self.snake_pos
+        # Limites de la fenêtre
+        if point[0] < 0 or point[0] > frame_size_x - 10 or point[1] < 0 or point[1] > frame_size_y - 10:
+            return True
+        # Collision avec le corps
+        if point in self.snake_body[1:]:
+            return True
+        return False
+
+    def play_step(self, action):
+        self.frame_iteration += 1
+        # Récupérer l'événement de fermeture de la fenêtre
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+
+        # Mouvement
+        self.move(action)
+        self.snake_body.insert(0, self.snake_pos[:])
+
+        # Récompense
+        reward = 0
+        done = False
+
+        if self.is_collision() or self.frame_iteration > 100 * len(self.snake_body):
+            done = True
+            reward = -10
+            return reward, done, self.score
+
+        if self.snake_pos == self.food_pos:
+            self.score += 1
+            reward = 10
+            self.food_spawn = False
+        else:
+            self.snake_body.pop()
+
+        if not self.food_spawn:
+            self.food_pos = [random.randrange(1, (frame_size_x // 10)) * 10,
+                             random.randrange(1, (frame_size_y // 10)) * 10]
+        self.food_spawn = True
+
+        # Mise à jour de l'interface
+        self.update_ui(reward)
+        fps_controller.tick(difficulty)
+
+        return reward, done, self.score
+
+    def move(self, action):
+        clock_wise = ['RIGHT', 'DOWN', 'LEFT', 'UP']
+        idx = clock_wise.index(self.direction)
+
+        if np.array_equal(action, [1, 0, 0]):
+            new_dir = clock_wise[idx]  # Pas de changement
+        elif np.array_equal(action, [0, 1, 0]):
+            next_idx = (idx + 1) % 4
+            new_dir = clock_wise[next_idx]  # Tourne à droite
+        else:  # [0, 0, 1]
+            next_idx = (idx - 1) % 4
+            new_dir = clock_wise[next_idx]  # Tourne à gauche
+
+        self.direction = new_dir
+
+        if self.direction == 'RIGHT':
+            self.snake_pos[0] += 10
+        elif self.direction == 'LEFT':
+            self.snake_pos[0] -= 10
+        elif self.direction == 'UP':
+            self.snake_pos[1] -= 10
+        elif self.direction == 'DOWN':
+            self.snake_pos[1] += 10
+
+    def update_ui(self, reward):
+        game_window.fill(black)
+
+        for pos in self.snake_body:
+            pygame.draw.rect(game_window, green, pygame.Rect(pos[0], pos[1], 10, 10))
+
+        pygame.draw.rect(game_window, white, pygame.Rect(self.food_pos[0], self.food_pos[1], 10, 10))
+
+        # Affichage des informations
+        font = pygame.font.SysFont('consolas', 20)
+        text_score = font.render('Score: ' + str(self.score), True, white)
+        text_generation = font.render('Génération: ' + str(agent.n_games), True, white)
+        text_reward_total = font.render('Récompense Totale: ' + str(agent.reward_total), True, white)
+
+        game_window.blit(text_score, [0, 0])
+        game_window.blit(text_generation, [0, 20])
+        game_window.blit(text_reward_total, [0, 40])
+
+        # Indicateur de récompense ou punition
+        if reward > 0:
+            pygame.draw.circle(game_window, green, (frame_size_x - 20, 20), 10)
+        elif reward < 0:
+            pygame.draw.circle(game_window, red, (frame_size_x - 20, 20), 10)
+
+        pygame.display.flip()
+
+# --- Fonction principale ---
+def train():
+    global agent
+    agent = DQNAgent()
+    game = SnakeGameAI()
+    while True:
+        # Récupérer l'état actuel
+        state_old = agent.get_state(game)
+
+        # Décider de l'action à prendre
+        action = [0, 0, 0]
+        move = agent.act(state_old)
+        action[move] = 1
+
+        # Effectuer l'action et obtenir la récompense
+        reward, done, score = game.play_step(action)
+        state_new = agent.get_state(game)
+
+        # Entraîner la mémoire courte
+        agent.train_short_memory(state_old, move, reward, state_new, done)
+
+        # Stocker dans la mémoire
+        agent.remember(state_old, move, reward, state_new, done)
+
+        if done:
+            # Entraîner la mémoire longue (replay)
+            game.reset()
+            agent.n_games += 1
+            agent.reward_total += reward
+            agent.replay()
+            agent.epsilon = max(min_epsilon, agent.epsilon * epsilon_decay)
+            if agent.n_games % target_update == 0:
+                agent.update_target_model()
+
+if __name__ == '__main__':
+    train()
