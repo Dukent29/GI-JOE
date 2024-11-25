@@ -7,7 +7,7 @@ Download the Python 3 installer package from the official website and install it
 
 Run the following in the terminal to install the Pygame library
 ```
-pip install pygame
+pip install -U pygame==2.6.0
 ```
 
 
