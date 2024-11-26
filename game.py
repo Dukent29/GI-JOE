@@ -1,21 +1,21 @@
 """
-Snake AI
+Snake AI with Persistent Memory and Model
 Made with PyGame and PyTorch
 """
 
 import pygame
 import sys
-import time
 import random
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque
+import pickle
 
 
 # --- Hyperparamètres ---
-difficulty = 25  # Vitesse du jeu
+difficulty = 50  # Vitesse du jeu
 max_memory_size = 100000
 batch_size = 1000
 gamma = 0.9  # Facteur d'escompte
@@ -61,7 +61,7 @@ class DQNAgent:
         model = nn.Sequential(
             nn.Linear(11, 256),
             nn.ReLU(),
-            nn.Linear(256, 3)  # Modifié de 4 à 3
+            nn.Linear(256, 3)
         )
         return model
 
@@ -123,7 +123,7 @@ class DQNAgent:
 
     def act(self, state):
         if random.uniform(0, 1) < self.epsilon:
-            return random.randint(0, 2)  # Modifié de 3 à 2
+            return random.randint(0, 2)
         state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0)
         prediction = self.model(state0)
         return torch.argmax(prediction).item()
@@ -140,7 +140,6 @@ class DQNAgent:
         next_states = torch.tensor(np.array(next_states), dtype=torch.float)
         dones = torch.tensor(dones, dtype=torch.bool)
 
-        # Q valeurs actuelles
         pred = self.model(states)
         target = pred.clone()
         for idx in range(len(dones)):
@@ -168,6 +167,34 @@ class DQNAgent:
         loss.backward()
         self.optimizer.step()
 
+
+# --- Persistance : Sauvegarde et Chargement ---
+def save_memory(agent, file_name="memory.pkl"):
+    with open(file_name, "wb") as f:
+        pickle.dump(agent.memory, f)
+    print("Mémoire sauvegardée dans", file_name)
+
+def load_memory(agent, file_name="memory.pkl"):
+    try:
+        with open(file_name, "rb") as f:
+            agent.memory = pickle.load(f)
+        print("Mémoire chargée depuis", file_name)
+    except FileNotFoundError:
+        print("Aucun fichier de mémoire trouvé, démarrage avec une mémoire vide.")
+
+def save_model(agent, file_name="model.pth"):
+    torch.save(agent.model.state_dict(), file_name)
+    print("Modèle sauvegardé dans", file_name)
+
+def load_model(agent, file_name="model.pth"):
+    try:
+        agent.model.load_state_dict(torch.load(file_name))
+        agent.update_target_model()
+        print("Modèle chargé depuis", file_name)
+    except FileNotFoundError:
+        print("Aucun fichier de modèle trouvé, démarrage avec un modèle vierge.")
+
+
 # --- Classe du jeu ---
 class SnakeGameAI:
     def __init__(self):
@@ -182,42 +209,62 @@ class SnakeGameAI:
         self.direction = 'RIGHT'
         self.score = 0
         self.frame_iteration = 0
+        self.time_limit = 20  # Temps limite par partie, en secondes
+        self.start_time = pygame.time.get_ticks()  # Temps de début en millisecondes
 
     def is_collision(self, point=None):
         if point is None:
             point = self.snake_pos
-        # Limites de la fenêtre
         if point[0] < 0 or point[0] > frame_size_x - 10 or point[1] < 0 or point[1] > frame_size_y - 10:
             return True
-        # Collision avec le corps
         if point in self.snake_body[1:]:
             return True
         return False
 
     def play_step(self, action):
         self.frame_iteration += 1
-        # Récupérer l'événement de fermeture de la fenêtre
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                # Sauvegarder avant de quitter
+                save_memory(agent, "memory.pkl")
+                save_model(agent, "model.pth")
                 pygame.quit()
                 sys.exit()
 
-        # Mouvement
         self.move(action)
         self.snake_body.insert(0, self.snake_pos[:])
 
-        # Récompense
-        reward = 0
+        reward = -0.05  # Pénalité pour chaque mouvement
         done = False
 
-        if self.is_collision() or self.frame_iteration > 100 * len(self.snake_body):
+        # Calcul de la récompense basée sur la proximité (entre 0.01 et 0.1)
+        distance = np.linalg.norm(np.array(self.snake_pos) - np.array(self.food_pos))
+        max_distance = np.linalg.norm(np.array([0, 0]) - np.array([frame_size_x, frame_size_y]))
+        proximity_reward = 0.01 + (1 - (distance / max_distance)) * (0.1 - 0.01)  # Entre 0.01 et 0.1
+        reward += proximity_reward
+
+        # Gestion du chronomètre
+        current_time = pygame.time.get_ticks()  # Temps actuel en millisecondes
+        elapsed_time = (current_time - self.start_time) / 1000  # Temps écoulé en secondes
+        time_remaining = max(0, self.time_limit - elapsed_time)  # Temps restant en secondes
+
+        if time_remaining == 0:
             done = True
-            reward = -10
+            reward -= 20  # Pénalité pour le temps écoulé
+            agent.reward_total += reward  # Mettre à jour la récompense totale
+            self.update_ui(reward, time_remaining)
+            return reward, done, self.score
+
+        if self.is_collision():
+            done = True
+            reward -= 100  # Pénalité pour la mort
+            agent.reward_total += reward  # Mettre à jour la récompense totale
+            self.update_ui(reward, time_remaining)
             return reward, done, self.score
 
         if self.snake_pos == self.food_pos:
             self.score += 1
-            reward = 10
+            reward += 50  # Récompense pour avoir mangé la nourriture
             self.food_spawn = False
         else:
             self.snake_body.pop()
@@ -227,10 +274,10 @@ class SnakeGameAI:
                              random.randrange(1, (frame_size_y // 10)) * 10]
         self.food_spawn = True
 
-        # Mise à jour de l'interface
-        self.update_ui(reward)
-        fps_controller.tick(difficulty)
+        agent.reward_total += reward  # Mettre à jour la récompense totale
 
+        self.update_ui(reward, time_remaining)
+        fps_controller.tick(difficulty)
         return reward, done, self.score
 
     def move(self, action):
@@ -238,13 +285,13 @@ class SnakeGameAI:
         idx = clock_wise.index(self.direction)
 
         if np.array_equal(action, [1, 0, 0]):
-            new_dir = clock_wise[idx]  # Pas de changement
+            new_dir = clock_wise[idx]
         elif np.array_equal(action, [0, 1, 0]):
             next_idx = (idx + 1) % 4
-            new_dir = clock_wise[next_idx]  # Tourne à droite
-        else:  # [0, 0, 1]
+            new_dir = clock_wise[next_idx]
+        else:
             next_idx = (idx - 1) % 4
-            new_dir = clock_wise[next_idx]  # Tourne à gauche
+            new_dir = clock_wise[next_idx]
 
         self.direction = new_dir
 
@@ -257,25 +304,25 @@ class SnakeGameAI:
         elif self.direction == 'DOWN':
             self.snake_pos[1] += 10
 
-    def update_ui(self, reward):
+    def update_ui(self, reward, time_remaining=None):
         game_window.fill(black)
-
         for pos in self.snake_body:
             pygame.draw.rect(game_window, green, pygame.Rect(pos[0], pos[1], 10, 10))
-
         pygame.draw.rect(game_window, white, pygame.Rect(self.food_pos[0], self.food_pos[1], 10, 10))
 
-        # Affichage des informations
         font = pygame.font.SysFont('consolas', 20)
         text_score = font.render('Score: ' + str(self.score), True, white)
         text_generation = font.render('Génération: ' + str(agent.n_games), True, white)
-        text_reward_total = font.render('Récompense Totale: ' + str(agent.reward_total), True, white)
+        text_reward_total = font.render('Récompense Totale: ' + str(round(agent.reward_total, 2)), True, white)
 
         game_window.blit(text_score, [0, 0])
         game_window.blit(text_generation, [0, 20])
         game_window.blit(text_reward_total, [0, 40])
 
-        # Indicateur de récompense ou punition
+        if time_remaining is not None:
+            text_time = font.render('Temps restant: ' + str(int(time_remaining)) + 's', True, white)
+            game_window.blit(text_time, [0, 60])
+
         if reward > 0:
             pygame.draw.circle(game_window, green, (frame_size_x - 20, 20), 10)
         elif reward < 0:
@@ -283,39 +330,45 @@ class SnakeGameAI:
 
         pygame.display.flip()
 
+
 # --- Fonction principale ---
 def train():
     global agent
     agent = DQNAgent()
+
+    # Charger la mémoire et le modèle
+    load_memory(agent, "memory.pkl")
+    load_model(agent, "model.pth")
+
     game = SnakeGameAI()
+
     while True:
-        # Récupérer l'état actuel
-        state_old = agent.get_state(game)
+        try:
+            state_old = agent.get_state(game)
+            action = [0, 0, 0]
+            move = agent.act(state_old)
+            action[move] = 1
 
-        # Décider de l'action à prendre
-        action = [0, 0, 0]
-        move = agent.act(state_old)
-        action[move] = 1
+            reward, done, score = game.play_step(action)
+            state_new = agent.get_state(game)
 
-        # Effectuer l'action et obtenir la récompense
-        reward, done, score = game.play_step(action)
-        state_new = agent.get_state(game)
+            agent.train_short_memory(state_old, move, reward, state_new, done)
+            agent.remember(state_old, move, reward, state_new, done)
 
-        # Entraîner la mémoire courte
-        agent.train_short_memory(state_old, move, reward, state_new, done)
+            if done:
+                game.reset()
+                agent.n_games += 1
+                agent.replay()
+                agent.epsilon = max(min_epsilon, agent.epsilon * epsilon_decay)
+                if agent.n_games % target_update == 0:
+                    agent.update_target_model()
+        except KeyboardInterrupt:
+            print("Interruption détectée, sauvegarde en cours...")
+            save_memory(agent, "memory.pkl")
+            save_model(agent, "model.pth")
+            print("Mémoire et modèle sauvegardés. Programme terminé.")
+            break
 
-        # Stocker dans la mémoire
-        agent.remember(state_old, move, reward, state_new, done)
-
-        if done:
-            # Entraîner la mémoire longue (replay)
-            game.reset()
-            agent.n_games += 1
-            agent.reward_total += reward
-            agent.replay()
-            agent.epsilon = max(min_epsilon, agent.epsilon * epsilon_decay)
-            if agent.n_games % target_update == 0:
-                agent.update_target_model()
 
 if __name__ == '__main__':
     train()
