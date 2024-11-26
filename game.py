@@ -12,13 +12,14 @@ import torch.nn as nn
 import torch.optim as optim
 from collections import deque
 import pickle
+from torch.utils.tensorboard import SummaryWriter
 
 # --- Hyperparamètres ---
 difficulty = 30  # Réduire la vitesse du jeu pour améliorer les performances
-max_memory_size = 50000  # Réduire la taille de la mémoire de replay
-batch_size = 64  # Réduire la taille des batchs
-gamma = 0.9  # Facteur d'escompte
-epsilon_start = 1  # Taux d'exploration initial
+max_memory_size = 100000  # Augmenter la taille de la mémoire de replay
+batch_size = 64  # Taille des batchs
+gamma = 0.95  # Facteur d'escompte augmenté
+epsilon_start = 1.0  # Taux d'exploration initial
 epsilon_decay = 0.995
 min_epsilon = 0.01
 learning_rate = 0.001
@@ -27,8 +28,8 @@ target_update = 10  # Fréquence de mise à jour du réseau cible
 # --- Dimensions de la fenêtre ---
 rows = 2  # Nombre de lignes
 cols = 3  # Nombre de colonnes
-screen_width = 1536  # Assurez-vous que la largeur est divisible par le nombre de colonnes
-screen_height = 864  # Assurez-vous que la hauteur est divisible par le nombre de lignes
+screen_width = 1536  # Doit être divisible par le nombre de colonnes
+screen_height = 864  # Doit être divisible par le nombre de lignes
 single_frame_size_x = screen_width // cols  # 512
 single_frame_size_y = screen_height // rows  # 432
 total_frame_size_x = single_frame_size_x * cols  # 1536
@@ -53,25 +54,31 @@ fps_controller = pygame.time.Clock()
 # --- Flag de Débogage ---
 DEBUG = False  # Mettre à True pour activer les impressions de débogage
 
+# --- TensorBoard ---
+writer = SummaryWriter('runs/snake_ai')
+
 # --- Classes pour le DQN ---
 class DQNAgent:
-    def __init__(self, model=None, memory=None, epsilon=epsilon_start):
+    def __init__(self, model=None, memory=None, epsilon=epsilon_start, device='cpu'):
         self.memory = deque(maxlen=max_memory_size) if memory is None else memory
         self.epsilon = epsilon
-        self.model = self.build_model() if model is None else model
-        self.target_model = self.build_model()
+        self.device = device
+        self.model = self.build_model().to(self.device) if model is None else model.to(self.device)
+        self.target_model = self.build_model().to(self.device)
         if model is not None:
             self.target_model.load_state_dict(self.model.state_dict())
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
         self.criterion = nn.MSELoss()
-        self.reward_total = 0
+        self.step_count = 0  # Compteur pour TensorBoard
 
     def build_model(self):
-        # Réseau de neurones simplifié
+        # Réseau de neurones simplifié et optimisé
         model = nn.Sequential(
-            nn.Linear(11, 128),
+            nn.Linear(11, 64),
             nn.ReLU(),
-            nn.Linear(128, 3)
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3)
         )
         return model
 
@@ -79,7 +86,7 @@ class DQNAgent:
         self.target_model.load_state_dict(self.model.state_dict())
 
     def get_state(self, game):
-        # État du jeu sous forme de tableau binaire
+        # État du jeu sous forme de tableau normalisé
         head = game.snake_pos
         point_l = [head[0] - 10, head[1]]
         point_r = [head[0] + 10, head[1]]
@@ -116,17 +123,15 @@ class DQNAgent:
             dir_u,
             dir_d,
 
-            # Nourriture à gauche
+            # Nourriture relative à la position du serpent
             game.food_pos[0] < game.snake_pos[0],
-            # Nourriture à droite
             game.food_pos[0] > game.snake_pos[0],
-            # Nourriture en haut
             game.food_pos[1] < game.snake_pos[1],
-            # Nourriture en bas
             game.food_pos[1] > game.snake_pos[1]
         ]
 
-        return np.array(state, dtype=int)
+        # Conversion en float et normalisation
+        return np.array(state, dtype=float)
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
@@ -134,7 +139,7 @@ class DQNAgent:
     def act(self, state):
         if random.uniform(0, 1) < self.epsilon:
             return random.randint(0, 2)
-        state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0)
+        state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
         prediction = self.model(state0)
         return torch.argmax(prediction).item()
 
@@ -144,18 +149,21 @@ class DQNAgent:
         minibatch = random.sample(self.memory, batch_size)
         states, actions, rewards, next_states, dones = zip(*minibatch)
 
-        states = torch.tensor(np.array(states), dtype=torch.float)
-        actions = torch.tensor(actions, dtype=torch.long).unsqueeze(1)
-        rewards = torch.tensor(rewards, dtype=torch.float).unsqueeze(1)
-        next_states = torch.tensor(np.array(next_states), dtype=torch.float)
-        dones = torch.tensor(dones, dtype=torch.bool).unsqueeze(1)
+        states = torch.tensor(np.array(states), dtype=torch.float).to(self.device)
+        actions = torch.tensor(actions, dtype=torch.long).unsqueeze(1).to(self.device)
+        rewards = torch.tensor(rewards, dtype=torch.float).unsqueeze(1).to(self.device)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float).to(self.device)
+        dones = torch.tensor(dones, dtype=torch.bool).unsqueeze(1).to(self.device)
 
         # Prédictions actuelles
         pred = self.model(states).gather(1, actions)
 
-        # Calcul des cibles
+        # Calcul des cibles avec Double DQN
         with torch.no_grad():
-            Q_new = self.target_model(next_states).max(1)[0].unsqueeze(1)
+            # Sélectionner les actions optimales depuis le modèle actuel
+            best_actions = self.model(next_states).argmax(1).unsqueeze(1)
+            # Utiliser le modèle cible pour évaluer ces actions
+            Q_new = self.target_model(next_states).gather(1, best_actions)
             Q_new[dones] = 0.0
             target = rewards + gamma * Q_new
 
@@ -165,27 +173,38 @@ class DQNAgent:
         loss.backward()
         self.optimizer.step()
 
+        # Enregistrer la perte dans TensorBoard
+        writer.add_scalar('Loss/train', loss.item(), self.step_count)
+        self.step_count += 1
+
     def train_short_memory(self, state, action, reward, next_state, done):
-        state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0)
-        next_state0 = torch.tensor(next_state, dtype=torch.float).unsqueeze(0)
-        target = self.model(state0)
+        state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+        next_state0 = torch.tensor(next_state, dtype=torch.float).unsqueeze(0).to(self.device)
+        target = self.model(state0).clone()
+
         with torch.no_grad():
             if not done:
-                Q_new = reward + gamma * torch.max(self.target_model(next_state0))
+                Q_new = reward + gamma * self.target_model(next_state0).max(1)[0].unsqueeze(1)
             else:
-                Q_new = reward
+                Q_new = torch.tensor([[reward]], device=self.device)
         target[0][action] = Q_new
 
-        self.optimizer.zero_grad()
+        # Calcul de la perte et optimisation
         loss = self.criterion(self.model(state0), target)
+        self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+
+        # Enregistrer la perte dans TensorBoard
+        writer.add_scalar('Loss/train_short_memory', loss.item(), self.step_count)
+        self.step_count += 1
 
 # --- Classe du jeu ---
 class SnakeGameAI:
     def __init__(self, agent, surface):
         self.agent = agent
         self.surface = surface
+        self.reward_total = 0  # Récompense totale unique pour chaque jeu
         self.reset()
 
     def reset(self):
@@ -254,7 +273,7 @@ class SnakeGameAI:
         assert self.snake_pos[0] % 10 == 0 and self.snake_pos[1] % 10 == 0, "Snake position is not aligned to grid!"
         assert self.food_pos[0] % 10 == 0 and self.food_pos[1] % 10 == 0, "Food position is not aligned to grid!"
 
-        reward = 0
+        reward = -0.1  # Pénalité pour chaque mouvement
         done = False
 
         # Calcul de la distance après le mouvement
@@ -272,7 +291,7 @@ class SnakeGameAI:
         if time_remaining <= 0:
             done = True
             reward -= 20  # Pénalité pour le temps écoulé
-            self.agent.reward_total += reward
+            self.reward_total += reward
             if DEBUG:
                 print(f"[Gen {current_generation}] Time's up! Reward: {reward}")
             self.update_ui(reward, time_remaining, current_generation)
@@ -281,7 +300,7 @@ class SnakeGameAI:
         if self.is_collision():
             done = True
             reward -= 100  # Pénalité pour la mort
-            self.agent.reward_total += reward
+            self.reward_total += reward
             if DEBUG:
                 print(f"[Gen {current_generation}] Collision! Reward: {reward}")
             self.update_ui(reward, time_remaining, current_generation)
@@ -297,7 +316,7 @@ class SnakeGameAI:
             self.snake_body.pop()
 
         if not self.food_spawn:
-            # Assurez-vous que la nourriture ne spawn pas sur le corps du serpent
+            # Générer une nouvelle nourriture
             while True:
                 new_food_pos = [
                     random.randrange(0, single_frame_size_x // 10) * 10,
@@ -308,7 +327,7 @@ class SnakeGameAI:
                     break
             self.food_spawn = True
 
-        self.agent.reward_total += reward
+        self.reward_total += reward
 
         # Entraînement à court terme
         state_new = self.agent.get_state(self)
@@ -354,7 +373,7 @@ class SnakeGameAI:
         font = pygame.font.SysFont('consolas', 20)
         text_score = font.render('Score: ' + str(self.score), True, white)
         text_generation = font.render(f'Génération: {current_generation}', True, white)
-        text_reward_total = font.render('Récompense Totale: ' + str(round(self.agent.reward_total, 2)), True, white)
+        text_reward_total = font.render('Récompense Totale: ' + str(round(self.reward_total, 2)), True, white)
 
         self.surface.blit(text_score, [0, 0])
         self.surface.blit(text_generation, [0, 20])
@@ -388,15 +407,19 @@ def train():
         best_memory = None
         best_epsilon = epsilon_start
 
-    # Initialiser un seul agent avec le meilleur modèle
+    # Définir le périphérique (GPU si disponible)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Initialiser un seul agent partagé
     if best_model_state_dict is not None:
-        agent = DQNAgent(model=None, memory=None, epsilon=best_epsilon)
+        agent = DQNAgent(model=None, memory=None, epsilon=best_epsilon, device=device)
         agent.model.load_state_dict(best_model_state_dict)
         agent.update_target_model()
         if best_memory is not None:
             agent.memory = deque(best_memory, maxlen=max_memory_size)
     else:
-        agent = DQNAgent()
+        agent = DQNAgent(device=device)
 
     generation = 0
 
@@ -405,7 +428,7 @@ def train():
             generation += 1
             print(f"\n--- Génération {generation} ---")
 
-            # Créer 6 sous-surfaces pour les 6 jeux arrangés en grille 3x2
+            # Créer les jeux
             games = []
             for row in range(rows):
                 for col in range(cols):
@@ -417,7 +440,7 @@ def train():
                     surface_rect = (x, y, w, h)
                     print(f"Creating subsurface: {surface_rect}")
 
-                    # Vérifier que le rectangle est à l'intérieur de la fenêtre principale
+                    # Vérifier les dimensions
                     if (x + w > total_frame_size_x) or (y + h > total_frame_size_y):
                         print(f"Erreur: Le rectangle {surface_rect} dépasse la fenêtre principale.")
                         pygame.quit()
@@ -427,17 +450,18 @@ def train():
                     game = SnakeGameAI(agent, surface)
                     games.append(game)
 
-            # Réinitialiser les récompenses totales pour l'agent
-            agent.reward_total = 0
+            # Réinitialiser les récompenses totales pour chaque jeu
+            for game in games:
+                game.reward_total = 0
 
-            # Jouer les 6 parties jusqu'à ce qu'elles se terminent
+            # Jouer les parties
             done_flags = [False] * (rows * cols)
             while not all(done_flags):
                 for i, game in enumerate(games):
                     if not done_flags[i]:
                         reward, done, score = game.play_step(current_generation=generation)
                         done_flags[i] = done
-                        agent.reward_total += reward  # Accumuler la récompense totale
+                        # La récompense est déjà accumulée dans chaque jeu
 
             # Entraîner l'agent une fois après avoir joué toutes les parties
             agent.replay()
@@ -447,19 +471,25 @@ def train():
                 print("Updating target network...")
                 agent.update_target_model()
 
-            # Déterminer le meilleur agent parmi les 6 (un seul agent partagé)
-            best_agent = agent
-            best_reward = agent.reward_total
-            best_index = 1  # Un seul agent
+            # Collecter les récompenses totales de chaque jeu
+            rewards = [game.reward_total for game in games]
+            avg_reward = sum(rewards) / len(rewards)
+            max_reward = max(rewards)
+            print(f"Récompenses des jeux: {rewards}")
+            print(f"Récompense moyenne: {avg_reward}")
+            print(f"Récompense maximale: {max_reward}")
 
-            print(f"Agent {best_index} est le meilleur avec une récompense totale de {best_reward}")
+            # Enregistrer les récompenses moyennes et maximales dans TensorBoard
+            writer.add_scalar('Reward/avg', avg_reward, generation)
+            writer.add_scalar('Reward/max', max_reward, generation)
 
-            # Mettre à jour le meilleur modèle et la mémoire
-            best_model_state_dict = best_agent.model.state_dict()
-            best_memory = best_agent.memory
-            best_epsilon = max(min_epsilon, best_agent.epsilon * epsilon_decay)
+            # Mettre à jour les paramètres de l'agent
+            best_model_state_dict = agent.model.state_dict()
+            best_memory = agent.memory
+            best_epsilon = max(min_epsilon, agent.epsilon * epsilon_decay)
+            agent.epsilon = best_epsilon  # Mettre à jour l'epsilon de l'agent
 
-            # Sauvegarder le meilleur agent
+            # Sauvegarder l'agent partagé
             with open("best_agent.pkl", "wb") as f:
                 pickle.dump({
                     'model_state_dict': best_model_state_dict,
@@ -470,7 +500,7 @@ def train():
 
         except KeyboardInterrupt:
             print("Interruption détectée, sauvegarde en cours...")
-            # Sauvegarder le meilleur agent
+            # Sauvegarder l'agent partagé
             with open("best_agent.pkl", "wb") as f:
                 pickle.dump({
                     'model_state_dict': best_model_state_dict,
@@ -478,6 +508,7 @@ def train():
                     'epsilon': best_epsilon
                 }, f)
             print("Meilleur agent sauvegardé. Programme terminé.")
+            writer.close()
             break
 
 if __name__ == '__main__':
