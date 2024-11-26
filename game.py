@@ -1,10 +1,9 @@
 """
 Snake AI with Persistent Memory and Model
-Made with PyGame and PyTorch
+Made with Arcade and PyTorch
 """
 
-import pygame
-import sys
+import arcade
 import random
 import numpy as np
 import torch
@@ -13,49 +12,38 @@ import torch.optim as optim
 from collections import deque
 import pickle
 from torch.utils.tensorboard import SummaryWriter
+import time  # Importer le module time pour utiliser time.time()
 
 # --- Hyperparamètres ---
-difficulty = 30  # Réduire la vitesse du jeu pour améliorer les performances
-max_memory_size = 100000  # Augmenter la taille de la mémoire de replay
-batch_size = 64  # Taille des batchs
-gamma = 0.95  # Facteur d'escompte augmenté
-epsilon_start = 1.0  # Taux d'exploration initial
+difficulty = 0.05  # Temps en secondes entre chaque mise à jour (20 FPS)
+max_memory_size = 100000
+batch_size = 64
+gamma = 0.95
+epsilon_start = 1.0
 epsilon_decay = 0.995
 min_epsilon = 0.01
 learning_rate = 0.001
-target_update = 10  # Fréquence de mise à jour du réseau cible
+target_update = 10
 
 # --- Dimensions de la fenêtre ---
-rows = 2  # Nombre de lignes
-cols = 3  # Nombre de colonnes
-screen_width = 1536  # Doit être divisible par le nombre de colonnes
-screen_height = 864  # Doit être divisible par le nombre de lignes
+rows = 2
+cols = 3
+screen_width = 1536
+screen_height = 864
 single_frame_size_x = screen_width // cols  # 512
 single_frame_size_y = screen_height // rows  # 432
-total_frame_size_x = single_frame_size_x * cols  # 1536
-total_frame_size_y = single_frame_size_y * rows  # 864
-
-# --- Initialisation de Pygame ---
-pygame.init()
-pygame.display.set_caption('Snake AI - Generation Training')
-# Mode fenêtre avec taille exacte
-game_window = pygame.display.set_mode((screen_width, screen_height))
-print(f"Window size set to: {game_window.get_size()}")
-
-# --- Couleurs ---
-black = pygame.Color(0, 0, 0)
-white = pygame.Color(255, 255, 255)
-red = pygame.Color(255, 0, 0)
-green = pygame.Color(0, 255, 0)
-
-# --- Contrôleur FPS ---
-fps_controller = pygame.time.Clock()
-
-# --- Flag de Débogage ---
-DEBUG = False  # Mettre à True pour activer les impressions de débogage
 
 # --- TensorBoard ---
-writer = SummaryWriter('runs/snake_ai')
+writer = SummaryWriter('runs/snake_ai_arcade')
+
+# --- Couleurs ---
+COLOR_BACKGROUND = arcade.color.BLACK
+COLOR_SNAKE = arcade.color.GREEN
+COLOR_FOOD = arcade.color.RED
+COLOR_TEXT = arcade.color.WHITE
+COLOR_REWARD_POSITIVE = arcade.color.GREEN
+COLOR_REWARD_NEGATIVE = arcade.color.RED
+COLOR_BEST_GAME_BORDER = arcade.color.GREEN  # Couleur pour le contour du meilleur jeu
 
 # --- Classes pour le DQN ---
 class DQNAgent:
@@ -90,8 +78,8 @@ class DQNAgent:
         head = game.snake_pos
         point_l = [head[0] - 10, head[1]]
         point_r = [head[0] + 10, head[1]]
-        point_u = [head[0], head[1] - 10]
-        point_d = [head[0], head[1] + 10]
+        point_u = [head[0], head[1] + 10]  # En Arcade, l'axe Y augmente vers le haut
+        point_d = [head[0], head[1] - 10]
 
         dir_l = game.direction == 'LEFT'
         dir_r = game.direction == 'RIGHT'
@@ -124,10 +112,10 @@ class DQNAgent:
             dir_d,
 
             # Nourriture relative à la position du serpent
-            game.food_pos[0] < game.snake_pos[0],
-            game.food_pos[0] > game.snake_pos[0],
-            game.food_pos[1] < game.snake_pos[1],
-            game.food_pos[1] > game.snake_pos[1]
+            game.food_pos[0] < game.snake_pos[0],  # nourriture à gauche
+            game.food_pos[0] > game.snake_pos[0],  # nourriture à droite
+            game.food_pos[1] > game.snake_pos[1],  # nourriture en haut
+            game.food_pos[1] < game.snake_pos[1]   # nourriture en bas
         ]
 
         # Conversion en float et normalisation
@@ -160,9 +148,7 @@ class DQNAgent:
 
         # Calcul des cibles avec Double DQN
         with torch.no_grad():
-            # Sélectionner les actions optimales depuis le modèle actuel
             best_actions = self.model(next_states).argmax(1).unsqueeze(1)
-            # Utiliser le modèle cible pour évaluer ces actions
             Q_new = self.target_model(next_states).gather(1, best_actions)
             Q_new[dones] = 0.0
             target = rewards + gamma * Q_new
@@ -174,7 +160,8 @@ class DQNAgent:
         self.optimizer.step()
 
         # Enregistrer la perte dans TensorBoard
-        writer.add_scalar('Loss/train', loss.item(), self.step_count)
+        if self.step_count % 10 == 0:
+            writer.add_scalar('Loss/train', loss.item(), self.step_count)
         self.step_count += 1
 
     def train_short_memory(self, state, action, reward, next_state, done):
@@ -196,22 +183,25 @@ class DQNAgent:
         self.optimizer.step()
 
         # Enregistrer la perte dans TensorBoard
-        writer.add_scalar('Loss/train_short_memory', loss.item(), self.step_count)
+        if self.step_count % 10 == 0:
+            writer.add_scalar('Loss/train_short_memory', loss.item(), self.step_count)
         self.step_count += 1
 
-# --- Classe du jeu ---
+# --- Classe du jeu avec Arcade ---
 class SnakeGameAI:
-    def __init__(self, agent, surface):
+    def __init__(self, agent, x_offset=0, y_offset=0):
         self.agent = agent
-        self.surface = surface
-        self.reward_total = 0  # Récompense totale unique pour chaque jeu
+        self.x_offset = x_offset
+        self.y_offset = y_offset
+        self.reward_total = 0
+        self.last_reward = 0  # Pour stocker la dernière récompense
         self.reset()
 
     def reset(self):
         # Aligner la position initiale sur la grille de 10 pixels
         self.snake_pos = [
-            (single_frame_size_x // 2) // 10 * 10,
-            (single_frame_size_y // 2) // 10 * 10
+            self.x_offset + ((single_frame_size_x // 2) // 10 * 10),
+            self.y_offset + ((single_frame_size_y // 2) // 10 * 10)
         ]
         self.snake_body = [
             self.snake_pos[:],
@@ -221,15 +211,14 @@ class SnakeGameAI:
         self.food_spawn = True
         self.direction = 'RIGHT'
         self.score = 0
-        self.frame_iteration = 0
         self.time_limit = 20  # Temps limite par partie, en secondes
-        self.start_time = pygame.time.get_ticks()  # Temps de début en millisecondes
+        self.start_time = time.time()  # Utiliser time.time() au lieu de arcade.get_time()
 
         # Générer une position de nourriture qui ne chevauche pas le serpent
         while True:
             self.food_pos = [
-                random.randrange(0, single_frame_size_x // 10) * 10,
-                random.randrange(0, single_frame_size_y // 10) * 10
+                self.x_offset + random.randrange(0, single_frame_size_x // 10) * 10,
+                self.y_offset + random.randrange(0, single_frame_size_y // 10) * 10
             ]
             if self.food_pos not in self.snake_body:
                 break
@@ -237,110 +226,12 @@ class SnakeGameAI:
     def is_collision(self, point=None):
         if point is None:
             point = self.snake_pos
-        if point[0] < 0 or point[0] >= single_frame_size_x or point[1] < 0 or point[1] >= single_frame_size_y:
+        if point[0] < self.x_offset or point[0] >= self.x_offset + single_frame_size_x or \
+                point[1] < self.y_offset or point[1] >= self.y_offset + single_frame_size_y:
             return True
         if point in self.snake_body[1:]:
             return True
         return False
-
-    def play_step(self, current_generation):
-        self.frame_iteration += 1
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                # Sauvegarder avant de quitter
-                pygame.quit()
-                sys.exit()
-
-        state_old = self.agent.get_state(self)
-        move = self.agent.act(state_old)
-        action = [0, 0, 0]
-        action[move] = 1
-
-        if DEBUG:
-            print(f"[Gen {current_generation}] Snake Position Avant Mouvement: {self.snake_pos}")
-            print(f"[Gen {current_generation}] Food Position: {self.food_pos}")
-
-        # Calcul de la distance avant le mouvement
-        distance_old = np.linalg.norm(np.array(self.snake_pos) - np.array(self.food_pos))
-
-        self.move(action)
-        self.snake_body.insert(0, self.snake_pos[:])
-
-        if DEBUG:
-            print(f"[Gen {current_generation}] Snake Position Après Mouvement: {self.snake_pos}")
-
-        # Vérifier l'alignement des positions
-        assert self.snake_pos[0] % 10 == 0 and self.snake_pos[1] % 10 == 0, "Snake position is not aligned to grid!"
-        assert self.food_pos[0] % 10 == 0 and self.food_pos[1] % 10 == 0, "Food position is not aligned to grid!"
-
-        reward = -0.1  # Pénalité pour chaque mouvement
-        done = False
-
-        # Calcul de la distance après le mouvement
-        distance_new = np.linalg.norm(np.array(self.snake_pos) - np.array(self.food_pos))
-
-        # Récompense ou punition basée sur le déplacement vers/au-delà de la nourriture
-        delta_distance = distance_old - distance_new
-        reward += delta_distance * 0.1  # Récompense proportionnelle
-
-        # Gestion du chronomètre
-        current_time = pygame.time.get_ticks()  # Temps actuel en millisecondes
-        elapsed_time = (current_time - self.start_time) / 1000  # Temps écoulé en secondes
-        time_remaining = max(0, self.time_limit - elapsed_time)  # Temps restant en secondes
-
-        if time_remaining <= 0:
-            done = True
-            reward -= 20  # Pénalité pour le temps écoulé
-            self.reward_total += reward
-            if DEBUG:
-                print(f"[Gen {current_generation}] Time's up! Reward: {reward}")
-            self.update_ui(reward, time_remaining, current_generation)
-            return reward, done, self.score
-
-        if self.is_collision():
-            done = True
-            reward -= 100  # Pénalité pour la mort
-            self.reward_total += reward
-            if DEBUG:
-                print(f"[Gen {current_generation}] Collision! Reward: {reward}")
-            self.update_ui(reward, time_remaining, current_generation)
-            return reward, done, self.score
-
-        if self.snake_pos == self.food_pos:
-            self.score += 1
-            reward += 50  # Récompense pour avoir mangé la nourriture
-            self.food_spawn = False
-            if DEBUG:
-                print(f"[Gen {current_generation}] Ate food! Reward: {reward}")
-        else:
-            pass  # Pas de suppression du segment ici
-
-        # Toujours supprimer le dernier segment pour maintenir la taille constante
-        self.snake_body.pop()
-
-        if not self.food_spawn:
-            # Générer une nouvelle nourriture
-            while True:
-                new_food_pos = [
-                    random.randrange(0, single_frame_size_x // 10) * 10,
-                    random.randrange(0, single_frame_size_y // 10) * 10
-                ]
-                if new_food_pos not in self.snake_body:
-                    self.food_pos = new_food_pos
-                    break
-            self.food_spawn = True
-
-        self.reward_total += reward
-
-        # Entraînement à court terme
-        state_new = self.agent.get_state(self)
-        self.agent.train_short_memory(state_old, move, reward, state_new, done)
-        # Mémoriser
-        self.agent.remember(state_old, move, reward, state_new, done)
-
-        self.update_ui(reward, time_remaining, current_generation)
-        fps_controller.tick(difficulty)
-        return reward, done, self.score
 
     def move(self, action):
         clock_wise = ['RIGHT', 'DOWN', 'LEFT', 'UP']
@@ -362,135 +253,232 @@ class SnakeGameAI:
         elif self.direction == 'LEFT':
             self.snake_pos[0] -= 10
         elif self.direction == 'UP':
-            self.snake_pos[1] -= 10
-        elif self.direction == 'DOWN':
             self.snake_pos[1] += 10
+        elif self.direction == 'DOWN':
+            self.snake_pos[1] -= 10
 
-    def update_ui(self, reward, time_remaining=None, current_generation=1):
-        # Dessiner uniquement sur la surface assignée
-        self.surface.fill(black)
-        for pos in self.snake_body:
-            pygame.draw.rect(self.surface, green, pygame.Rect(pos[0], pos[1], 10, 10))
-        pygame.draw.rect(self.surface, white, pygame.Rect(self.food_pos[0], self.food_pos[1], 10, 10))
+    def play_step(self, delta_time, current_generation):
+        state_old = self.agent.get_state(self)
+        move = self.agent.act(state_old)
+        action = [0, 0, 0]
+        action[move] = 1
 
-        font = pygame.font.SysFont('consolas', 20)
-        text_score = font.render('Score: ' + str(self.score), True, white)
-        text_generation = font.render(f'Génération: {current_generation}', True, white)
-        text_reward_total = font.render('Récompense Totale: ' + str(round(self.reward_total, 2)), True, white)
+        # Calcul de la distance avant le mouvement
+        distance_old = np.linalg.norm(np.array(self.snake_pos) - np.array(self.food_pos))
 
-        self.surface.blit(text_score, [0, 0])
-        self.surface.blit(text_generation, [0, 20])
-        self.surface.blit(text_reward_total, [0, 40])
+        self.move(action)
+        self.snake_body.insert(0, self.snake_pos[:])
 
-        if time_remaining is not None:
-            text_time = font.render('Temps restant: ' + str(int(time_remaining)) + 's', True, white)
-            self.surface.blit(text_time, [0, 60])
+        reward = -0.1  # Pénalité pour chaque mouvement
+        done = False
 
-        # Indicateur de récompense/punition
-        if reward > 0:
-            pygame.draw.circle(self.surface, green, (single_frame_size_x - 20, 20), 10)
-        elif reward < 0:
-            pygame.draw.circle(self.surface, red, (single_frame_size_x - 20, 20), 10)
+        # Calcul de la distance après le mouvement
+        distance_new = np.linalg.norm(np.array(self.snake_pos) - np.array(self.food_pos))
 
-        pygame.display.update()
+        # Récompense ou punition basée sur le déplacement
+        delta_distance = distance_old - distance_new
+        reward += delta_distance * 0.1
 
-# --- Fonction principale ---
-def train():
-    # Charger le modèle et la mémoire du meilleur agent précédent
-    try:
-        with open("best_agent.pkl", "rb") as f:
-            best_agent_data = pickle.load(f)
-        print("Meilleur agent chargé depuis best_agent.pkl")
-        best_model_state_dict = best_agent_data['model_state_dict']
-        best_memory = best_agent_data['memory']
-        best_epsilon = best_agent_data['epsilon']
-    except FileNotFoundError:
-        print("Aucun agent précédent trouvé, création d'un nouvel agent.")
-        best_model_state_dict = None
-        best_memory = None
-        best_epsilon = epsilon_start
+        # Gestion du chronomètre
+        elapsed_time = time.time() - self.start_time  # Utiliser time.time() ici aussi
+        time_remaining = max(0, self.time_limit - elapsed_time)
+        self.time_remaining = time_remaining  # Stocker le temps restant pour l'affichage
 
-    # Définir le périphérique (GPU si disponible)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+        if time_remaining <= 0:
+            done = True
+            reward -= 20
+            self.reward_total += reward
+            self.last_reward = reward  # Stocker la dernière récompense
+            return reward, done, self.score
 
-    # Initialiser un seul agent partagé
-    if best_model_state_dict is not None:
-        agent = DQNAgent(model=None, memory=None, epsilon=best_epsilon, device=device)
-        agent.model.load_state_dict(best_model_state_dict)
-        agent.update_target_model()
-        if best_memory is not None:
-            agent.memory = deque(best_memory, maxlen=max_memory_size)
-    else:
-        agent = DQNAgent(device=device)
+        if self.is_collision():
+            done = True
+            reward -= 100
+            self.reward_total += reward
+            self.last_reward = reward
+            return reward, done, self.score
 
-    generation = 0
+        if self.snake_pos == self.food_pos:
+            self.score += 1
+            reward += 50
+            self.food_spawn = False
+        else:
+            pass
 
-    while True:
+        # Toujours supprimer le dernier segment pour maintenir la taille constante
+        self.snake_body.pop()
+
+        if not self.food_spawn:
+            # Générer une nouvelle nourriture
+            while True:
+                new_food_pos = [
+                    self.x_offset + random.randrange(0, single_frame_size_x // 10) * 10,
+                    self.y_offset + random.randrange(0, single_frame_size_y // 10) * 10
+                ]
+                if new_food_pos not in self.snake_body:
+                    self.food_pos = new_food_pos
+                    break
+            self.food_spawn = True
+
+        self.reward_total += reward
+        self.last_reward = reward
+
+        # Entraînement à court terme
+        state_new = self.agent.get_state(self)
+        self.agent.train_short_memory(state_old, move, reward, state_new, done)
+        # Mémoriser
+        self.agent.remember(state_old, move, reward, state_new, done)
+
+        return reward, done, self.score
+
+# --- Classe principale de l'application ---
+class SnakeAIApp(arcade.Window):
+    def __init__(self):
+        super().__init__(screen_width, screen_height, "Snake AI - Arcade Version", update_rate=difficulty)
+        arcade.set_background_color(COLOR_BACKGROUND)
+
+        # Charger le modèle et la mémoire du meilleur agent précédent
         try:
-            generation += 1
-            print(f"\n--- Génération {generation} ---")
+            with open("best_agent.pkl", "rb") as f:
+                best_agent_data = pickle.load(f)
+            print("Meilleur agent chargé depuis best_agent.pkl")
+            best_model_state_dict = best_agent_data['model_state_dict']
+            best_memory = best_agent_data['memory']
+            best_epsilon = best_agent_data['epsilon']
+        except FileNotFoundError:
+            print("Aucun agent précédent trouvé, création d'un nouvel agent.")
+            best_model_state_dict = None
+            best_memory = None
+            best_epsilon = epsilon_start
 
-            # Créer les jeux
-            games = []
-            for row in range(rows):
-                for col in range(cols):
-                    x = col * single_frame_size_x
-                    y = row * single_frame_size_y
-                    w = single_frame_size_x
-                    h = single_frame_size_y
+        # Définir le périphérique (GPU si disponible)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
 
-                    surface_rect = (x, y, w, h)
-                    print(f"Creating subsurface: {surface_rect}")
+        # Initialiser l'agent
+        if best_model_state_dict is not None:
+            self.agent = DQNAgent(model=None, memory=None, epsilon=best_epsilon, device=self.device)
+            self.agent.model.load_state_dict(best_model_state_dict)
+            self.agent.update_target_model()
+            if best_memory is not None:
+                self.agent.memory = deque(best_memory, maxlen=max_memory_size)
+        else:
+            self.agent = DQNAgent(device=self.device)
 
-                    # Vérifier les dimensions
-                    if (x + w > total_frame_size_x) or (y + h > total_frame_size_y):
-                        print(f"Erreur: Le rectangle {surface_rect} dépasse la fenêtre principale.")
-                        pygame.quit()
-                        sys.exit()
+        self.generation = 0
+        self.best_score = 0  # Meilleur score atteint jusqu'à présent
+        self.best_game_index = None  # Index du meilleur jeu de la génération
 
-                    surface = game_window.subsurface(surface_rect)
-                    game = SnakeGameAI(agent, surface)
-                    games.append(game)
+        # Créer les jeux
+        self.games = []
+        for row in range(rows):
+            for col in range(cols):
+                x_offset = col * single_frame_size_x
+                y_offset = row * single_frame_size_y
+                game = SnakeGameAI(self.agent, x_offset, y_offset)
+                self.games.append(game)
 
-            # Réinitialiser les récompenses totales pour chaque jeu
-            for game in games:
-                game.reward_total = 0
+        self.done_flags = [False] * len(self.games)
 
-            # Jouer les parties
-            done_flags = [False] * (rows * cols)
-            while not all(done_flags):
-                for i, game in enumerate(games):
-                    if not done_flags[i]:
-                        reward, done, score = game.play_step(current_generation=generation)
-                        done_flags[i] = done
-                        # La récompense est déjà accumulée dans chaque jeu
+    def on_draw(self):
+        arcade.start_render()
+        # Dessiner tous les jeux
+        for i, game in enumerate(self.games):
+            # Dessiner le cadre du meilleur jeu
+            if i == self.best_game_index:
+                arcade.draw_rectangle_outline(
+                    game.x_offset + single_frame_size_x / 2,
+                    game.y_offset + single_frame_size_y / 2,
+                    single_frame_size_x - 2,
+                    single_frame_size_y - 2,
+                    COLOR_BEST_GAME_BORDER,
+                    border_width=5
+                )
 
+            # Dessiner le serpent
+            for pos in game.snake_body:
+                arcade.draw_rectangle_filled(pos[0] + 5, pos[1] + 5, 10, 10, COLOR_SNAKE)
+            # Dessiner la nourriture
+            arcade.draw_rectangle_filled(game.food_pos[0] + 5, game.food_pos[1] + 5, 10, 10, COLOR_FOOD)
+            # Afficher le score
+            arcade.draw_text(f"Score: {game.score}", game.x_offset + 10, game.y_offset + single_frame_size_y - 20,
+                             COLOR_TEXT, 12)
+
+            # Afficher le temps restant
+            arcade.draw_text(f"Temps restant: {int(game.time_remaining)}s",
+                             game.x_offset + 10, game.y_offset + single_frame_size_y - 40,
+                             COLOR_TEXT, 12)
+
+            # Afficher la récompense totale
+            arcade.draw_text(f"Récompense Totale: {round(game.reward_total, 2)}",
+                             game.x_offset + 10, game.y_offset + single_frame_size_y - 60,
+                             COLOR_TEXT, 12)
+
+            # Indicateur de récompense/punition
+            if game.last_reward > 0:
+                arcade.draw_circle_filled(game.x_offset + single_frame_size_x - 20,
+                                          game.y_offset + single_frame_size_y - 20,
+                                          10, COLOR_REWARD_POSITIVE)
+            elif game.last_reward < 0:
+                arcade.draw_circle_filled(game.x_offset + single_frame_size_x - 20,
+                                          game.y_offset + single_frame_size_y - 20,
+                                          10, COLOR_REWARD_NEGATIVE)
+
+        # Afficher la génération en haut au centre de la fenêtre
+        arcade.draw_text(f"Génération: {self.generation}",
+                         self.width // 2, self.height - 30,
+                         COLOR_TEXT, 20, anchor_x="center")
+
+        # Afficher le meilleur score atteint jusqu'à présent
+        arcade.draw_text(f"Meilleur Score: {self.best_score}",
+                         self.width // 2, self.height - 60,
+                         COLOR_TEXT, 16, anchor_x="center")
+
+    def on_update(self, delta_time):
+        # Jouer les parties
+        if not all(self.done_flags):
+            for i, game in enumerate(self.games):
+                if not self.done_flags[i]:
+                    reward, done, score = game.play_step(delta_time, current_generation=self.generation)
+                    self.done_flags[i] = done
+        else:
             # Entraîner l'agent une fois après avoir joué toutes les parties
-            agent.replay()
+            self.agent.replay()
 
             # Mettre à jour le réseau cible périodiquement
-            if generation % target_update == 0:
+            if self.generation % target_update == 0:
                 print("Updating target network...")
-                agent.update_target_model()
+                self.agent.update_target_model()
 
-            # Collecter les récompenses totales de chaque jeu
-            rewards = [game.reward_total for game in games]
+            # Collecter les récompenses totales et les scores de chaque jeu
+            rewards = [game.reward_total for game in self.games]
+            scores = [game.score for game in self.games]
             avg_reward = sum(rewards) / len(rewards)
             max_reward = max(rewards)
+            max_score = max(scores)
             print(f"Récompenses des jeux: {rewards}")
+            print(f"Scores des jeux: {scores}")
             print(f"Récompense moyenne: {avg_reward}")
             print(f"Récompense maximale: {max_reward}")
+            print(f"Meilleur score de la génération: {max_score}")
+
+            # Mettre à jour le meilleur score global si nécessaire
+            if max_score > self.best_score:
+                self.best_score = max_score
+
+            # Identifier l'index du meilleur jeu
+            self.best_game_index = scores.index(max_score)
 
             # Enregistrer les récompenses moyennes et maximales dans TensorBoard
-            writer.add_scalar('Reward/avg', avg_reward, generation)
-            writer.add_scalar('Reward/max', max_reward, generation)
+            writer.add_scalar('Reward/avg', avg_reward, self.generation)
+            writer.add_scalar('Reward/max', max_reward, self.generation)
+            writer.add_scalar('Score/max', max_score, self.generation)
 
             # Mettre à jour les paramètres de l'agent
-            best_model_state_dict = agent.model.state_dict()
-            best_memory = agent.memory
-            best_epsilon = max(min_epsilon, agent.epsilon * epsilon_decay)
-            agent.epsilon = best_epsilon  # Mettre à jour l'epsilon de l'agent
+            best_model_state_dict = self.agent.model.state_dict()
+            best_memory = self.agent.memory
+            best_epsilon = max(min_epsilon, self.agent.epsilon * epsilon_decay)
+            self.agent.epsilon = best_epsilon
 
             # Sauvegarder l'agent partagé
             with open("best_agent.pkl", "wb") as f:
@@ -501,18 +489,34 @@ def train():
                 }, f)
             print("Meilleur agent sauvegardé dans best_agent.pkl")
 
-        except KeyboardInterrupt:
-            print("Interruption détectée, sauvegarde en cours...")
-            # Sauvegarder l'agent partagé
-            with open("best_agent.pkl", "wb") as f:
-                pickle.dump({
-                    'model_state_dict': best_model_state_dict,
-                    'memory': best_memory,
-                    'epsilon': best_epsilon
-                }, f)
-            print("Meilleur agent sauvegardé. Programme terminé.")
-            writer.close()
-            break
+            # Préparer la prochaine génération
+            self.generation += 1
+            self.done_flags = [False] * len(self.games)
+            for game in self.games:
+                game.reward_total = 0
+                game.last_reward = 0
+                game.reset()
+
+    def on_close(self):
+        print("Fermeture du jeu, sauvegarde en cours...")
+        # Sauvegarder l'agent partagé
+        best_model_state_dict = self.agent.model.state_dict()
+        best_memory = self.agent.memory
+        best_epsilon = self.agent.epsilon
+        with open("best_agent.pkl", "wb") as f:
+            pickle.dump({
+                'model_state_dict': best_model_state_dict,
+                'memory': best_memory,
+                'epsilon': best_epsilon
+            }, f)
+        print("Meilleur agent sauvegardé. Programme terminé.")
+        writer.close()
+        super().on_close()
+
+# --- Fonction principale ---
+def main():
+    app = SnakeAIApp()
+    arcade.run()
 
 if __name__ == '__main__':
-    train()
+    main()
