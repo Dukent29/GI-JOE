@@ -13,26 +13,27 @@ import torch.optim as optim
 from collections import deque
 import pickle
 
-
 # --- Hyperparamètres ---
 difficulty = 50  # Vitesse du jeu
 max_memory_size = 100000
 batch_size = 1000
 gamma = 0.9  # Facteur d'escompte
-epsilon = 1  # Taux d'exploration initial
+epsilon_start = 1  # Taux d'exploration initial
 epsilon_decay = 0.995
 min_epsilon = 0.01
 learning_rate = 0.001
 target_update = 10  # Fréquence de mise à jour du réseau cible
 
 # --- Dimensions de la fenêtre ---
-frame_size_x = 720
-frame_size_y = 480
+single_frame_size_x = 720
+single_frame_size_y = 480
+total_frame_size_x = single_frame_size_x * 2  # Pour deux jeux côte à côte
+total_frame_size_y = single_frame_size_y
 
 # --- Initialisation de Pygame ---
 pygame.init()
-pygame.display.set_caption('Snake AI')
-game_window = pygame.display.set_mode((frame_size_x, frame_size_y))
+pygame.display.set_caption('Snake AI - Generation Training')
+game_window = pygame.display.set_mode((total_frame_size_x, total_frame_size_y))
 
 # --- Couleurs ---
 black = pygame.Color(0, 0, 0)
@@ -45,10 +46,10 @@ fps_controller = pygame.time.Clock()
 
 # --- Classes pour le DQN ---
 class DQNAgent:
-    def __init__(self):
-        self.memory = deque(maxlen=max_memory_size)
+    def __init__(self, model=None, memory=None, epsilon=epsilon_start):
+        self.memory = deque(maxlen=max_memory_size) if memory is None else memory
         self.epsilon = epsilon
-        self.model = self.build_model()
+        self.model = self.build_model() if model is None else model
         self.target_model = self.build_model()
         self.update_target_model()
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
@@ -168,43 +169,19 @@ class DQNAgent:
         self.optimizer.step()
 
 
-# --- Persistance : Sauvegarde et Chargement ---
-def save_memory(agent, file_name="memory.pkl"):
-    with open(file_name, "wb") as f:
-        pickle.dump(agent.memory, f)
-    print("Mémoire sauvegardée dans", file_name)
-
-def load_memory(agent, file_name="memory.pkl"):
-    try:
-        with open(file_name, "rb") as f:
-            agent.memory = pickle.load(f)
-        print("Mémoire chargée depuis", file_name)
-    except FileNotFoundError:
-        print("Aucun fichier de mémoire trouvé, démarrage avec une mémoire vide.")
-
-def save_model(agent, file_name="model.pth"):
-    torch.save(agent.model.state_dict(), file_name)
-    print("Modèle sauvegardé dans", file_name)
-
-def load_model(agent, file_name="model.pth"):
-    try:
-        agent.model.load_state_dict(torch.load(file_name))
-        agent.update_target_model()
-        print("Modèle chargé depuis", file_name)
-    except FileNotFoundError:
-        print("Aucun fichier de modèle trouvé, démarrage avec un modèle vierge.")
-
-
 # --- Classe du jeu ---
 class SnakeGameAI:
-    def __init__(self):
+    def __init__(self, agent, surface, offset_x=0):
+        self.agent = agent
+        self.surface = surface
+        self.offset_x = offset_x
         self.reset()
 
     def reset(self):
-        self.snake_pos = [frame_size_x / 2, frame_size_y / 2]
-        self.snake_body = [self.snake_pos[:], [self.snake_pos[0] - 10, self.snake_pos[1]], [self.snake_pos[0] - 20, self.snake_pos[1]]]
-        self.food_pos = [random.randrange(1, (frame_size_x // 10)) * 10,
-                         random.randrange(1, (frame_size_y // 10)) * 10]
+        self.snake_pos = [single_frame_size_x / 2, single_frame_size_y / 2]
+        self.snake_body = [self.snake_pos[:],
+                           [self.snake_pos[0] - 10, self.snake_pos[1]],
+                           [self.snake_pos[0] - 20, self.snake_pos[1]]]
         self.food_spawn = True
         self.direction = 'RIGHT'
         self.score = 0
@@ -212,36 +189,50 @@ class SnakeGameAI:
         self.time_limit = 20  # Temps limite par partie, en secondes
         self.start_time = pygame.time.get_ticks()  # Temps de début en millisecondes
 
+        # Générer une position de nourriture qui ne chevauche pas le serpent
+        while True:
+            self.food_pos = [random.randrange(1, (single_frame_size_x // 10)) * 10,
+                             random.randrange(1, (single_frame_size_y // 10)) * 10]
+            if self.food_pos not in self.snake_body:
+                break
+
     def is_collision(self, point=None):
         if point is None:
             point = self.snake_pos
-        if point[0] < 0 or point[0] > frame_size_x - 10 or point[1] < 0 or point[1] > frame_size_y - 10:
+        if point[0] < 0 or point[0] > single_frame_size_x - 10 or point[1] < 0 or point[1] > single_frame_size_y - 10:
             return True
         if point in self.snake_body[1:]:
             return True
         return False
 
-    def play_step(self, action):
+    def play_step(self):
         self.frame_iteration += 1
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 # Sauvegarder avant de quitter
-                save_memory(agent, "memory.pkl")
-                save_model(agent, "model.pth")
                 pygame.quit()
                 sys.exit()
+
+        state_old = self.agent.get_state(self)
+        action = [0, 0, 0]
+        move = self.agent.act(state_old)
+        action[move] = 1
+
+        # Calcul de la distance avant le mouvement
+        distance_old = np.linalg.norm(np.array(self.snake_pos) - np.array(self.food_pos))
 
         self.move(action)
         self.snake_body.insert(0, self.snake_pos[:])
 
-        reward = -0.05  # Pénalité pour chaque mouvement
+        reward = 0  # Initialiser la récompense à 0
         done = False
 
-        # Calcul de la récompense basée sur la proximité (entre 0.01 et 0.1)
-        distance = np.linalg.norm(np.array(self.snake_pos) - np.array(self.food_pos))
-        max_distance = np.linalg.norm(np.array([0, 0]) - np.array([frame_size_x, frame_size_y]))
-        proximity_reward = 0.01 + (1 - (distance / max_distance)) * (0.1 - 0.01)  # Entre 0.01 et 0.1
-        reward += proximity_reward
+        # Calcul de la distance après le mouvement
+        distance_new = np.linalg.norm(np.array(self.snake_pos) - np.array(self.food_pos))
+
+        # Récompense ou punition basée sur le déplacement vers/au-delà de la nourriture
+        delta_distance = distance_old - distance_new
+        reward += delta_distance * 0.1  # Récompense proportionnelle
 
         # Gestion du chronomètre
         current_time = pygame.time.get_ticks()  # Temps actuel en millisecondes
@@ -251,14 +242,16 @@ class SnakeGameAI:
         if time_remaining == 0:
             done = True
             reward -= 20  # Pénalité pour le temps écoulé
-            agent.reward_total += reward  # Mettre à jour la récompense totale
+            self.agent.reward_total += reward  # Mettre à jour la récompense totale
+            print(f"Time's up! Reward: {reward}")
             self.update_ui(reward, time_remaining)
             return reward, done, self.score
 
         if self.is_collision():
             done = True
             reward -= 100  # Pénalité pour la mort
-            agent.reward_total += reward  # Mettre à jour la récompense totale
+            self.agent.reward_total += reward  # Mettre à jour la récompense totale
+            print(f"Collision! Reward: {reward}")
             self.update_ui(reward, time_remaining)
             return reward, done, self.score
 
@@ -266,15 +259,26 @@ class SnakeGameAI:
             self.score += 1
             reward += 50  # Récompense pour avoir mangé la nourriture
             self.food_spawn = False
+            print(f"Ate food! Reward: {reward}")
         else:
             self.snake_body.pop()
 
         if not self.food_spawn:
-            self.food_pos = [random.randrange(1, (frame_size_x // 10)) * 10,
-                             random.randrange(1, (frame_size_y // 10)) * 10]
-        self.food_spawn = True
+            # Assurez-vous que la nourriture ne spawn pas sur le corps du serpent
+            while True:
+                new_food_pos = [random.randrange(1, (single_frame_size_x // 10)) * 10,
+                                random.randrange(1, (single_frame_size_y // 10)) * 10]
+                if new_food_pos not in self.snake_body:
+                    self.food_pos = new_food_pos
+                    break
+            self.food_spawn = True
 
-        agent.reward_total += reward  # Mettre à jour la récompense totale
+        self.agent.reward_total += reward  # Mettre à jour la récompense totale
+
+        # Entraînement à court terme
+        state_new = self.agent.get_state(self)
+        self.agent.train_short_memory(state_old, move, reward, state_new, done)
+        self.agent.remember(state_old, move, reward, state_new, done)
 
         self.update_ui(reward, time_remaining)
         fps_controller.tick(difficulty)
@@ -285,13 +289,13 @@ class SnakeGameAI:
         idx = clock_wise.index(self.direction)
 
         if np.array_equal(action, [1, 0, 0]):
-            new_dir = clock_wise[idx]
+            new_dir = clock_wise[idx]  # Aller tout droit
         elif np.array_equal(action, [0, 1, 0]):
             next_idx = (idx + 1) % 4
-            new_dir = clock_wise[next_idx]
+            new_dir = clock_wise[next_idx]  # Tourner à droite
         else:
             next_idx = (idx - 1) % 4
-            new_dir = clock_wise[next_idx]
+            new_dir = clock_wise[next_idx]  # Tourner à gauche
 
         self.direction = new_dir
 
@@ -305,68 +309,128 @@ class SnakeGameAI:
             self.snake_pos[1] += 10
 
     def update_ui(self, reward, time_remaining=None):
-        game_window.fill(black)
+        # Dessiner uniquement sur la surface assignée
+        self.surface.fill(black)
         for pos in self.snake_body:
-            pygame.draw.rect(game_window, green, pygame.Rect(pos[0], pos[1], 10, 10))
-        pygame.draw.rect(game_window, white, pygame.Rect(self.food_pos[0], self.food_pos[1], 10, 10))
+            pygame.draw.rect(self.surface, green, pygame.Rect(pos[0], pos[1], 10, 10))
+        pygame.draw.rect(self.surface, white, pygame.Rect(self.food_pos[0], self.food_pos[1], 10, 10))
 
         font = pygame.font.SysFont('consolas', 20)
         text_score = font.render('Score: ' + str(self.score), True, white)
-        text_generation = font.render('Génération: ' + str(agent.n_games), True, white)
-        text_reward_total = font.render('Récompense Totale: ' + str(round(agent.reward_total, 2)), True, white)
+        text_generation = font.render('Génération: ' + str(self.agent.n_games), True, white)
+        text_reward_total = font.render('Récompense Totale: ' + str(round(self.agent.reward_total, 2)), True, white)
 
-        game_window.blit(text_score, [0, 0])
-        game_window.blit(text_generation, [0, 20])
-        game_window.blit(text_reward_total, [0, 40])
+        self.surface.blit(text_score, [0, 0])
+        self.surface.blit(text_generation, [0, 20])
+        self.surface.blit(text_reward_total, [0, 40])
 
         if time_remaining is not None:
             text_time = font.render('Temps restant: ' + str(int(time_remaining)) + 's', True, white)
-            game_window.blit(text_time, [0, 60])
+            self.surface.blit(text_time, [0, 60])
 
+        # Indicateur de récompense/punition
         if reward > 0:
-            pygame.draw.circle(game_window, green, (frame_size_x - 20, 20), 10)
+            pygame.draw.circle(self.surface, green, (single_frame_size_x - 20, 20), 10)
         elif reward < 0:
-            pygame.draw.circle(game_window, red, (frame_size_x - 20, 20), 10)
+            pygame.draw.circle(self.surface, red, (single_frame_size_x - 20, 20), 10)
 
-        pygame.display.flip()
+        pygame.display.update()
 
 
 # --- Fonction principale ---
 def train():
-    global agent
-    agent = DQNAgent()
+    # Charger le modèle et la mémoire du meilleur agent précédent
+    try:
+        with open("best_agent.pkl", "rb") as f:
+            best_agent_data = pickle.load(f)
+        print("Meilleur agent chargé depuis best_agent.pkl")
+        best_model_state_dict = best_agent_data['model_state_dict']
+        best_memory = best_agent_data['memory']
+        best_epsilon = best_agent_data['epsilon']
+    except FileNotFoundError:
+        print("Aucun agent précédent trouvé, création d'un nouvel agent.")
+        best_model_state_dict = None
+        best_memory = None
+        best_epsilon = epsilon_start
 
-    # Charger la mémoire et le modèle
-    load_memory(agent, "memory.pkl")
-    load_model(agent, "model.pth")
-
-    game = SnakeGameAI()
+    generation = 0
 
     while True:
         try:
-            state_old = agent.get_state(game)
-            action = [0, 0, 0]
-            move = agent.act(state_old)
-            action[move] = 1
+            generation += 1
+            print(f"\n--- Génération {generation} ---")
 
-            reward, done, score = game.play_step(action)
-            state_new = agent.get_state(game)
+            # Initialiser les deux agents avec le meilleur modèle
+            agent1 = DQNAgent(model=None, memory=None, epsilon=best_epsilon)
+            agent2 = DQNAgent(model=None, memory=None, epsilon=best_epsilon)
 
-            agent.train_short_memory(state_old, move, reward, state_new, done)
-            agent.remember(state_old, move, reward, state_new, done)
+            if best_model_state_dict is not None:
+                agent1.model.load_state_dict(best_model_state_dict)
+                agent1.update_target_model()
+                agent2.model.load_state_dict(best_model_state_dict)
+                agent2.update_target_model()
 
-            if done:
-                game.reset()
-                agent.n_games += 1
-                agent.replay()
-                agent.epsilon = max(min_epsilon, agent.epsilon * epsilon_decay)
-                if agent.n_games % target_update == 0:
-                    agent.update_target_model()
+            if best_memory is not None:
+                agent1.memory = deque(best_memory, maxlen=max_memory_size)
+                agent2.memory = deque(best_memory, maxlen=max_memory_size)
+
+            # Créer deux surfaces pour les deux jeux
+            surface1 = game_window.subsurface((0, 0, single_frame_size_x, single_frame_size_y))
+            surface2 = game_window.subsurface((single_frame_size_x, 0, single_frame_size_x, single_frame_size_y))
+
+            # Créer deux jeux pour les deux agents
+            game1 = SnakeGameAI(agent1, surface1, offset_x=0)
+            game2 = SnakeGameAI(agent2, surface2, offset_x=single_frame_size_x)
+
+            # Réinitialiser les récompenses totales pour chaque agent
+            agent1.reward_total = 0
+            agent2.reward_total = 0
+
+            # Jouer les deux parties jusqu'à ce qu'elles se terminent
+            done1 = False
+            done2 = False
+            while not done1 or not done2:
+                if not done1:
+                    reward1, done1, score1 = game1.play_step()
+                if not done2:
+                    reward2, done2, score2 = game2.play_step()
+
+            # Entraîner les agents
+            agent1.replay()
+            agent2.replay()
+
+            # Déterminer le meilleur agent
+            if agent1.reward_total >= agent2.reward_total:
+                best_agent = agent1
+                print(f"L'agent 1 est le meilleur avec une récompense totale de {agent1.reward_total}")
+            else:
+                best_agent = agent2
+                print(f"L'agent 2 est le meilleur avec une récompense totale de {agent2.reward_total}")
+
+            # Mettre à jour le meilleur modèle et la mémoire
+            best_model_state_dict = best_agent.model.state_dict()
+            best_memory = best_agent.memory
+            best_epsilon = max(min_epsilon, best_agent.epsilon * epsilon_decay)
+
+            # Sauvegarder le meilleur agent
+            with open("best_agent.pkl", "wb") as f:
+                pickle.dump({
+                    'model_state_dict': best_model_state_dict,
+                    'memory': best_memory,
+                    'epsilon': best_epsilon
+                }, f)
+            print("Meilleur agent sauvegardé dans best_agent.pkl")
+
         except KeyboardInterrupt:
             print("Interruption détectée, sauvegarde en cours...")
-            save_memory(agent, "memory.pkl")
-            save_model(agent, "model.pth")
-            print("Mémoire et modèle sauvegardés. Programme terminé.")
+            # Sauvegarder le meilleur agent
+            with open("best_agent.pkl", "wb") as f:
+                pickle.dump({
+                    'model_state_dict': best_model_state_dict,
+                    'memory': best_memory,
+                    'epsilon': best_epsilon
+                }, f)
+            print("Meilleur agent sauvegardé. Programme terminé.")
             break
 
 
