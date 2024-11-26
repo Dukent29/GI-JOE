@@ -313,7 +313,10 @@ class SnakeGameAI:
             if DEBUG:
                 print(f"[Gen {current_generation}] Ate food! Reward: {reward}")
         else:
-            self.snake_body.pop()
+            pass  # Pas de suppression du segment ici
+
+        # Toujours supprimer le dernier segment pour maintenir la taille constante
+        self.snake_body.pop()
 
         if not self.food_spawn:
             # Générer une nouvelle nourriture
