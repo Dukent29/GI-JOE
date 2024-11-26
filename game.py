@@ -1,8 +1,3 @@
-"""
-Snake Eater
-Made with PyGame
-"""
-
 import pygame, sys, time, random
 
 
@@ -12,7 +7,7 @@ import pygame, sys, time, random
 # Hard      ->  40
 # Harder    ->  60
 # Impossible->  120
-difficulty = 25
+difficulty = 35
 
 # Window size
 frame_size_x = 720
