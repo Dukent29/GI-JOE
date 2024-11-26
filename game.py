@@ -12,7 +12,10 @@ import torch.optim as optim
 from collections import deque
 import pickle
 from torch.utils.tensorboard import SummaryWriter
-import time  # Importer le module time pour utiliser time.time()
+import time
+import platform
+import ctypes
+import subprocess
 
 # --- Hyperparamètres ---
 difficulty = 0.05  # Temps en secondes entre chaque mise à jour (20 FPS)
@@ -44,6 +47,37 @@ COLOR_TEXT = arcade.color.WHITE
 COLOR_REWARD_POSITIVE = arcade.color.GREEN
 COLOR_REWARD_NEGATIVE = arcade.color.RED
 COLOR_BEST_GAME_BORDER = arcade.color.GREEN  # Couleur pour le contour du meilleur jeu
+
+# --- Variables Globales pour Empêcher la Mise en Veille ---
+caffeinate_process = None  # Pour macOS
+
+# --- Fonctions pour Empêcher la Mise en Veille ---
+def prevent_sleep():
+    os_name = platform.system()
+    if os_name == "Windows":
+        # ES_CONTINUOUS = 0x80000000
+        # ES_SYSTEM_REQUIRED = 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+    elif os_name == "Darwin":  # macOS
+        global caffeinate_process
+        caffeinate_process = subprocess.Popen(['caffeinate'])
+    elif os_name == "Linux":
+        # Sous Linux, la mise en veille dépend de l'environnement de bureau
+        # Vous pouvez ajouter des commandes spécifiques si nécessaire
+        pass
+
+def allow_sleep():
+    os_name = platform.system()
+    if os_name == "Windows":
+        # Réinitialiser l'état pour permettre la mise en veille
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+    elif os_name == "Darwin":  # macOS
+        global caffeinate_process
+        if caffeinate_process:
+            caffeinate_process.terminate()
+    elif os_name == "Linux":
+        # Sous Linux, aucune action spécifique
+        pass
 
 # --- Classes pour le DQN ---
 class DQNAgent:
@@ -280,7 +314,7 @@ class SnakeGameAI:
         reward += delta_distance * 0.1
 
         # Gestion du chronomètre
-        elapsed_time = time.time() - self.start_time  # Utiliser time.time() ici aussi
+        elapsed_time = time.time() - self.start_time
         time_remaining = max(0, self.time_limit - elapsed_time)
         self.time_remaining = time_remaining  # Stocker le temps restant pour l'affichage
 
@@ -335,6 +369,9 @@ class SnakeAIApp(arcade.Window):
     def __init__(self):
         super().__init__(screen_width, screen_height, "Snake AI - Arcade Version", update_rate=difficulty)
         arcade.set_background_color(COLOR_BACKGROUND)
+
+        # Empêcher la mise en veille du système
+        prevent_sleep()
 
         # Charger le modèle et la mémoire du meilleur agent précédent
         try:
@@ -510,6 +547,10 @@ class SnakeAIApp(arcade.Window):
             }, f)
         print("Meilleur agent sauvegardé. Programme terminé.")
         writer.close()
+
+        # Permettre la mise en veille du système
+        allow_sleep()
+
         super().on_close()
 
 # --- Fonction principale ---
