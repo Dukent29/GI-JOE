@@ -302,11 +302,10 @@ class SnakeGameAI:
             self.score += 1
             reward += 50
             self.food_spawn = False
+            # Ne pas supprimer le dernier segment pour que le serpent grandisse
         else:
-            pass
-
-        # Toujours supprimer le dernier segment pour maintenir la taille constante
-        self.snake_body.pop()
+            # Toujours supprimer le dernier segment pour maintenir la taille constante
+            self.snake_body.pop()
 
         if not self.food_spawn:
             # Générer une nouvelle nourriture
