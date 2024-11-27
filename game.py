@@ -1,5 +1,5 @@
 """
-Snake AI avec Vision Améliorée
+Snake AI avec Vision Améliorée et Représentation Matricielle de l'Environnement
 Réalisé avec Arcade et PyTorch
 """
 
@@ -36,6 +36,14 @@ screen_height = 864
 single_frame_size_x = screen_width // cols  # 512
 single_frame_size_y = screen_height // rows  # 432
 
+# --- Taille de la grille ---
+grid_size = 10  # Chaque cellule de la grille fait 10 pixels
+grid_width = single_frame_size_x // grid_size
+grid_height = single_frame_size_y // grid_size
+
+# --- Taille de la vue du serpent ---
+view_size = 11  # La grille vue par le serpent sera de 11x11
+
 # --- TensorBoard ---
 writer = SummaryWriter('runs/snake_ai_arcade')
 
@@ -48,10 +56,6 @@ COLOR_REWARD_POSITIVE = arcade.color.GREEN
 COLOR_REWARD_NEGATIVE = arcade.color.RED
 COLOR_BEST_GAME_BORDER = arcade.color.GREEN  # Couleur pour le contour du meilleur jeu
 COLOR_WALL_BORDER = arcade.color.WHITE  # Couleur pour les murs
-COLOR_VISION_WALL = arcade.color.GRAY
-COLOR_VISION_BODY = arcade.color.YELLOW
-COLOR_VISION_FOOD = arcade.color.RED
-COLOR_VISION_DEFAULT = arcade.color.BLUE
 COLOR_TRAJECTORY = arcade.color.CYAN  # Couleur pour la trajectoire choisie
 
 # --- Variables Globales pour Empêcher la Mise en Veille ---
@@ -100,13 +104,16 @@ class DQNAgent:
         self.step_count = 0  # Compteur pour TensorBoard
 
     def build_model(self):
-        # Le nouvel état a 36 éléments : 8 directions x 4 informations + 4 pour la direction actuelle
+        # Nouveau modèle avec CNN pour traiter la grille
         model = nn.Sequential(
-            nn.Linear(36, 256),
+            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),  # Entrée : 3 canaux (mur, corps, nourriture)
             nn.ReLU(),
-            nn.Linear(256, 128),
+            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.Linear(128, 3)
+            nn.Flatten(),
+            nn.Linear(32 * view_size * view_size, 128),
+            nn.ReLU(),
+            nn.Linear(128, 3)  # Sortie : 3 actions possibles
         )
         return model
 
@@ -122,7 +129,7 @@ class DQNAgent:
     def act(self, state):
         if random.uniform(0, 1) < self.epsilon:
             return random.randint(0, 2)
-        state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+        state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)  # Ajouter batch_size dimension
         prediction = self.model(state0)
         return torch.argmax(prediction).item()
 
@@ -190,32 +197,31 @@ class SnakeGameAI:
         self.y_offset = y_offset
         self.reward_total = 0
         self.last_reward = 0  # Pour stocker la dernière récompense
-        self.vision_data = []  # Pour stocker les données de vision
         self.reset()
 
     def reset(self):
         # Aligner la position initiale sur la grille de 10 pixels
         self.snake_pos = [
-            self.x_offset + ((single_frame_size_x // 2) // 10 * 10),
-            self.y_offset + ((single_frame_size_y // 2) // 10 * 10)
+            self.x_offset + ((single_frame_size_x // 2) // grid_size * grid_size),
+            self.y_offset + ((single_frame_size_y // 2) // grid_size * grid_size)
         ]
         self.snake_body = [
             self.snake_pos[:],
-            [self.snake_pos[0] - 10, self.snake_pos[1]],
-            [self.snake_pos[0] - 20, self.snake_pos[1]]
+            [self.snake_pos[0] - grid_size, self.snake_pos[1]],
+            [self.snake_pos[0] - 2 * grid_size, self.snake_pos[1]]
         ]
         self.food_spawn = True
         self.direction = 'RIGHT'
         self.score = 0
-        self.time_limit = 20  # Temps limite du jeu
+        self.time_limit = 40  # Augmenter le temps limite du jeu
         self.start_time = time.time()
         self.next_direction = self.direction  # Initialiser la prochaine direction
 
         # Générer une position de nourriture qui ne chevauche pas le serpent
         while True:
             self.food_pos = [
-                self.x_offset + random.randrange(0, single_frame_size_x // 10) * 10,
-                self.y_offset + random.randrange(0, single_frame_size_y // 10) * 10
+                self.x_offset + random.randrange(0, grid_width) * grid_size,
+                self.y_offset + random.randrange(0, grid_height) * grid_size
             ]
             if self.food_pos not in self.snake_body:
                 break
@@ -234,9 +240,9 @@ class SnakeGameAI:
         clock_wise = ['RIGHT', 'DOWN', 'LEFT', 'UP']
         idx = clock_wise.index(self.direction)
 
-        if np.array_equal(action, [1, 0, 0]):
+        if action == 0:
             new_dir = clock_wise[idx]  # Aller tout droit
-        elif np.array_equal(action, [0, 1, 0]):
+        elif action == 1:
             next_idx = (idx + 1) % 4
             new_dir = clock_wise[next_idx]  # Tourner à droite
         else:
@@ -246,84 +252,34 @@ class SnakeGameAI:
         self.direction = new_dir
 
         if self.direction == 'RIGHT':
-            self.snake_pos[0] += 10
+            self.snake_pos[0] += grid_size
         elif self.direction == 'LEFT':
-            self.snake_pos[0] -= 10
+            self.snake_pos[0] -= grid_size
         elif self.direction == 'UP':
-            self.snake_pos[1] += 10
+            self.snake_pos[1] += grid_size
         elif self.direction == 'DOWN':
-            self.snake_pos[1] -= 10
+            self.snake_pos[1] -= grid_size
 
     def get_state(self):
-        head = self.snake_pos
-        dir_l = self.direction == 'LEFT'
-        dir_r = self.direction == 'RIGHT'
-        dir_u = self.direction == 'UP'
-        dir_d = self.direction == 'DOWN'
+        # Créer une grille centrée sur la tête du serpent
+        state = np.zeros((3, view_size, view_size), dtype=int)  # 3 canaux : mur, corps, nourriture
+        center = view_size // 2
 
-        # Vision dans 8 directions
-        def look_in_direction(direction):
-            position = head.copy()
-            distance = 0
-            food_found = 0
-            body_found = 0
-            wall_found = 0
-            while True:
-                distance += 1
-                position[0] += direction[0] * 10
-                position[1] += direction[1] * 10
+        for i in range(view_size):
+            for j in range(view_size):
+                x = self.snake_pos[0] + (j - center) * grid_size
+                y = self.snake_pos[1] + (i - center) * grid_size
 
-                if position[0] < self.x_offset or position[0] >= self.x_offset + single_frame_size_x or \
-                        position[1] < self.y_offset or position[1] >= self.y_offset + single_frame_size_y:
-                    wall_found = 1
-                    # Revenir dans les limites pour le dessin
-                    position[0] -= direction[0] * 10
-                    position[1] -= direction[1] * 10
-                    break
-                elif position == self.food_pos:
-                    food_found = 1
-                    break
-                elif position in self.snake_body[1:]:
-                    body_found = 1
-                    break
+                # Vérifier les limites du cadre
+                if x < self.x_offset or x >= self.x_offset + single_frame_size_x or \
+                        y < self.y_offset or y >= self.y_offset + single_frame_size_y:
+                    state[0, i, j] = 1  # Mur
+                elif [x, y] in self.snake_body[1:]:
+                    state[1, i, j] = 1  # Corps du serpent
+                elif [x, y] == self.food_pos:
+                    state[2, i, j] = 1  # Nourriture
 
-            # Distance normalisée
-            distance_norm = distance / max(single_frame_size_x, single_frame_size_y)
-            return [food_found, body_found, wall_found, distance_norm, position.copy()]
-
-        directions = [
-            (-1, 0),  # Gauche
-            (-1, -1),  # Diagonale bas-gauche
-            (0, -1),  # Bas
-            (1, -1),  # Diagonale bas-droite
-            (1, 0),  # Droite
-            (1, 1),  # Diagonale haut-droite
-            (0, 1),  # Haut
-            (-1, 1),  # Diagonale haut-gauche
-        ]
-
-        vision = []
-        self.vision_data = []  # Réinitialiser les données de vision
-        for d in directions:
-            vision_data = look_in_direction(d)
-            vision.extend(vision_data[:4])
-            self.vision_data.append({
-                'direction': d,
-                'food_found': vision_data[0],
-                'body_found': vision_data[1],
-                'wall_found': vision_data[2],
-                'distance': vision_data[3],
-                'end_position': vision_data[4],
-            })
-
-        state = vision + [
-            dir_l,
-            dir_r,
-            dir_u,
-            dir_d,
-        ]
-
-        return np.array(state, dtype=float)
+        return state
 
     def calculate_distance_to_food(self, position=None):
         if position is None:
@@ -333,28 +289,11 @@ class SnakeGameAI:
     def play_step(self, delta_time, current_generation):
         state_old = self.agent.get_state(self)
         move = self.agent.act(state_old)
-        action = [0, 0, 0]
-        action[move] = 1
-        self.last_action = action  # Stocker la dernière action
+        self.last_action = move  # Stocker la dernière action
 
         previous_distance = self.calculate_distance_to_food()
 
-        # Déterminer la prochaine direction basée sur l'action
-        clock_wise = ['RIGHT', 'DOWN', 'LEFT', 'UP']
-        idx = clock_wise.index(self.direction)
-
-        if np.array_equal(action, [1, 0, 0]):
-            next_direction = clock_wise[idx]  # Aller tout droit
-        elif np.array_equal(action, [0, 1, 0]):
-            next_idx = (idx + 1) % 4
-            next_direction = clock_wise[next_idx]  # Tourner à droite
-        else:
-            next_idx = (idx - 1) % 4
-            next_direction = clock_wise[next_idx]  # Tourner à gauche
-
-        self.next_direction = next_direction
-
-        self.move(action)
+        self.move(move)
         self.snake_body.insert(0, self.snake_pos[:])
 
         reward = 0
@@ -404,8 +343,8 @@ class SnakeGameAI:
             # Générer une nouvelle nourriture
             while True:
                 new_food_pos = [
-                    self.x_offset + random.randrange(0, single_frame_size_x // 10) * 10,
-                    self.y_offset + random.randrange(0, single_frame_size_y // 10) * 10
+                    self.x_offset + random.randrange(0, grid_width) * grid_size,
+                    self.y_offset + random.randrange(0, grid_height) * grid_size
                 ]
                 if new_food_pos not in self.snake_body:
                     self.food_pos = new_food_pos
@@ -477,13 +416,8 @@ class SnakeAIApp(arcade.Window):
             self.agent = DQNAgent(device=self.device, writer=writer)
 
     def build_model(self):
-        model = nn.Sequential(
-            nn.Linear(36, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 3)
-        )
+        # Doit correspondre à la méthode build_model de DQNAgent
+        model = DQNAgent().build_model()
         return model
 
     def on_draw(self):
@@ -513,9 +447,9 @@ class SnakeAIApp(arcade.Window):
 
             # Dessiner le serpent
             for pos in game.snake_body:
-                arcade.draw_rectangle_filled(pos[0] + 5, pos[1] + 5, 10, 10, COLOR_SNAKE)
+                arcade.draw_rectangle_filled(pos[0] + grid_size / 2, pos[1] + grid_size / 2, grid_size, grid_size, COLOR_SNAKE)
             # Dessiner la nourriture
-            arcade.draw_rectangle_filled(game.food_pos[0] + 5, game.food_pos[1] + 5, 10, 10, COLOR_FOOD)
+            arcade.draw_rectangle_filled(game.food_pos[0] + grid_size / 2, game.food_pos[1] + grid_size / 2, grid_size, grid_size, COLOR_FOOD)
             # Afficher le score
             arcade.draw_text(f"Score : {game.score}", game.x_offset + 10, game.y_offset + single_frame_size_y - 20,
                              COLOR_TEXT, 12)
@@ -540,32 +474,16 @@ class SnakeAIApp(arcade.Window):
                                           game.y_offset + single_frame_size_y - 20,
                                           10, COLOR_REWARD_NEGATIVE)
 
-            # Dessiner les lignes de vision
-            for vision in game.vision_data:
-                start_x = game.snake_pos[0] + 5  # Centre du carré
-                start_y = game.snake_pos[1] + 5
-                end_x = vision['end_position'][0] + 5
-                end_y = vision['end_position'][1] + 5
-                if vision['food_found']:
-                    color = COLOR_VISION_FOOD
-                elif vision['body_found']:
-                    color = COLOR_VISION_BODY
-                elif vision['wall_found']:
-                    color = COLOR_VISION_WALL
-                else:
-                    color = COLOR_VISION_DEFAULT
-                arcade.draw_line(start_x, start_y, end_x, end_y, color)
-
             # Dessiner la trajectoire choisie
             direction_vectors = {
-                'RIGHT': (10, 0),
-                'DOWN': (0, -10),
-                'LEFT': (-10, 0),
-                'UP': (0, 10)
+                'RIGHT': (grid_size, 0),
+                'DOWN': (0, -grid_size),
+                'LEFT': (-grid_size, 0),
+                'UP': (0, grid_size)
             }
-            dx, dy = direction_vectors[game.next_direction]
-            start_x = game.snake_pos[0] + 5
-            start_y = game.snake_pos[1] + 5
+            dx, dy = direction_vectors[game.direction]
+            start_x = game.snake_pos[0] + grid_size / 2
+            start_y = game.snake_pos[1] + grid_size / 2
             end_x = start_x + dx
             end_y = start_y + dy
             arcade.draw_line(start_x, start_y, end_x, end_y, COLOR_TRAJECTORY, 2)
