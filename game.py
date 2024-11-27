@@ -325,12 +325,19 @@ class SnakeGameAI:
 
         return np.array(state, dtype=float)
 
+    def calculate_distance_to_food(self, position=None):
+        if position is None:
+            position = self.snake_pos
+        return np.linalg.norm(np.array(position) - np.array(self.food_pos))
+
     def play_step(self, delta_time, current_generation):
         state_old = self.agent.get_state(self)
         move = self.agent.act(state_old)
         action = [0, 0, 0]
         action[move] = 1
         self.last_action = action  # Stocker la dernière action
+
+        previous_distance = self.calculate_distance_to_food()
 
         # Déterminer la prochaine direction basée sur l'action
         clock_wise = ['RIGHT', 'DOWN', 'LEFT', 'UP']
@@ -350,8 +357,20 @@ class SnakeGameAI:
         self.move(action)
         self.snake_body.insert(0, self.snake_pos[:])
 
-        reward = -0.1  # Pénalité pour chaque mouvement
+        reward = 0
         done = False
+
+        # Calculer la nouvelle distance à la nourriture
+        new_distance = self.calculate_distance_to_food()
+
+        # Récompense si on se rapproche de la nourriture
+        if new_distance < previous_distance:
+            reward += 1
+        else:
+            reward -= 1
+
+        # Pénalité pour chaque mouvement
+        reward -= 0.1
 
         # Gestion du chronomètre
         elapsed_time = time.time() - self.start_time
