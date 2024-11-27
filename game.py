@@ -1,5 +1,5 @@
 """
-Snake AI avec Vision Améliorée et Représentation Matricielle de l'Environnement
+Snake AI avec Gestion Automatique des Parties et Affichage Optimisé
 Réalisé avec Arcade et PyTorch
 """
 
@@ -12,10 +12,18 @@ import torch.optim as optim
 from collections import deque
 import pickle
 from torch.utils.tensorboard import SummaryWriter
+import psutil
 import time
 import platform
 import ctypes
 import subprocess
+
+# --- Configuration de la grille et des cadres ---
+grid_size = 10  # Chaque cellule de la grille fait 10 pixels
+single_frame_size_x = 512
+single_frame_size_y = 432
+grid_width = single_frame_size_x // grid_size
+grid_height = single_frame_size_y // grid_size
 
 # --- Hyperparamètres ---
 difficulty = 0.05  # Temps en secondes entre chaque mise à jour (20 FPS)
@@ -27,19 +35,6 @@ epsilon_decay = 0.995
 min_epsilon = 0.01
 learning_rate = 0.001
 target_update = 10
-
-# --- Dimensions de la fenêtre ---
-rows = 2
-cols = 3
-screen_width = 1536
-screen_height = 864
-single_frame_size_x = screen_width // cols  # 512
-single_frame_size_y = screen_height // rows  # 432
-
-# --- Taille de la grille ---
-grid_size = 10  # Chaque cellule de la grille fait 10 pixels
-grid_width = single_frame_size_x // grid_size
-grid_height = single_frame_size_y // grid_size
 
 # --- Taille de la vue du serpent ---
 view_size = 11  # La grille vue par le serpent sera de 11x11
@@ -57,6 +52,8 @@ COLOR_REWARD_NEGATIVE = arcade.color.RED
 COLOR_BEST_GAME_BORDER = arcade.color.GREEN  # Couleur pour le contour du meilleur jeu
 COLOR_WALL_BORDER = arcade.color.WHITE  # Couleur pour les murs
 COLOR_TRAJECTORY = arcade.color.CYAN  # Couleur pour la trajectoire choisie
+COLOR_POSITIVE_CIRCLE = arcade.color.GREEN
+COLOR_NEGATIVE_CIRCLE = arcade.color.RED
 
 # --- Variables Globales pour Empêcher la Mise en Veille ---
 caffeinate_process = None  # Pour macOS
@@ -213,7 +210,7 @@ class SnakeGameAI:
         self.food_spawn = True
         self.direction = 'RIGHT'
         self.score = 0
-        self.time_limit = 20  # Augmenter le temps limite du jeu
+        self.time_limit = 20  # Temps limite du jeu
         self.start_time = time.time()
         self.next_direction = self.direction  # Initialiser la prochaine direction
 
@@ -287,8 +284,12 @@ class SnakeGameAI:
         return np.linalg.norm(np.array(position) - np.array(self.food_pos))
 
     def play_step(self, delta_time, current_generation):
-        state_old = self.agent.get_state(self)
-        move = self.agent.act(state_old)
+        if self.agent:
+            state_old = self.agent.get_state(self)
+            move = self.agent.act(state_old)
+        else:
+            # Mouvement aléatoire si aucun agent n'est défini (pour le benchmark)
+            move = random.randint(0, 2)
         self.last_action = move  # Stocker la dernière action
 
         previous_distance = self.calculate_distance_to_food()
@@ -355,17 +356,26 @@ class SnakeGameAI:
         self.last_reward = reward
 
         # Entraînement à court terme
-        state_new = self.agent.get_state(self)
-        self.agent.train_short_memory(state_old, move, reward, state_new, done)
-        # Mémoriser
-        self.agent.remember(state_old, move, reward, state_new, done)
+        if self.agent:
+            state_new = self.agent.get_state(self)
+            self.agent.train_short_memory(state_old, move, reward, state_new, done)
+            # Mémoriser
+            self.agent.remember(state_old, move, reward, state_new, done)
 
         return reward, done, self.score
 
 # --- Classe principale de l'application ---
 class SnakeAIApp(arcade.Window):
     def __init__(self):
-        super().__init__(screen_width, screen_height, "Snake AI - Version Arcade", update_rate=difficulty)
+        # Initialiser les paramètres de la fenêtre après avoir détecté les performances
+        self.num_games = self.detect_performance()  # Déterminer automatiquement le nombre de parties
+        self.display_indices = [0, 1]  # Indices des parties à afficher
+
+        # Calculer la taille de la fenêtre en fonction des parties affichées
+        self.screen_width = single_frame_size_x * len(self.display_indices)
+        self.screen_height = single_frame_size_y + 80  # Ajouter de l'espace pour les informations
+
+        super().__init__(self.screen_width, self.screen_height, "Snake AI - Gestion Automatique", update_rate=difficulty)
         arcade.set_background_color(COLOR_BACKGROUND)
 
         # Empêcher la mise en veille du système
@@ -383,19 +393,57 @@ class SnakeAIApp(arcade.Window):
         self.agent = None
         self.load_agent()
 
-        # Créer les jeux
+        # Créer les jeux (basé sur le nombre détecté)
         self.games = []
-        for row in range(rows):
-            for col in range(cols):
-                x_offset = col * single_frame_size_x
-                y_offset = row * single_frame_size_y
-                game = SnakeGameAI(self.agent, x_offset, y_offset)
-                self.games.append(game)
+        for i in range(self.num_games):
+            # Les offsets ne sont utilisés que pour les parties affichées
+            if i in self.display_indices:
+                # Calculer l'offset pour aligner les parties vers le bas
+                x_offset = self.display_indices.index(i) * single_frame_size_x
+                y_offset = 0  # Aligné vers le bas
+            else:
+                # Les jeux non affichés n'ont pas besoin d'offset spécifique
+                x_offset = 0
+                y_offset = 0
+            game = SnakeGameAI(self.agent, x_offset, y_offset)
+            self.games.append(game)
 
         self.done_flags = [False] * len(self.games)
 
         # Pour calculer le temps par génération
         self.generation_start_time = time.time()
+
+    def detect_performance(self):
+        """
+        Détecte les performances disponibles et ajuste dynamiquement le nombre de parties à lancer.
+        """
+        # Détection CPU
+        cpu_count = psutil.cpu_count(logical=True)
+        cpu_freq = psutil.cpu_freq().max
+        total_memory = psutil.virtual_memory().available // (1024 ** 2)  # RAM disponible en MB
+        print(f"CPU: {cpu_count} cœurs @ {cpu_freq} MHz, RAM disponible: {total_memory} MB")
+
+        # Vérification GPU
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory // (1024 ** 2)  # Mémoire GPU en MB
+            print(f"GPU détecté : {gpu_name}, Mémoire GPU : {gpu_memory} MB")
+        else:
+            gpu_name = None
+            gpu_memory = 0
+            print("Pas de GPU détecté.")
+
+        # Estimer le nombre maximum de parties en fonction de la mémoire disponible
+        memory_per_game = 50  # Estimation de la mémoire utilisée par partie en MB
+        max_games_by_memory = total_memory // memory_per_game
+
+        # Limiter le nombre de parties pour éviter de surcharger le CPU
+        max_games_by_cpu = cpu_count * 2  # On suppose que chaque cœur peut gérer 2 threads
+
+        # Déterminer le nombre de parties
+        estimated_games = min(max_games_by_memory, max_games_by_cpu, 100)  # Limite à 100 pour éviter les excès
+        print(f"Nombre de parties estimé : {estimated_games}")
+        return max(1, estimated_games)  # Toujours avoir au moins 1 partie
 
     def load_agent(self):
         try:
@@ -422,90 +470,124 @@ class SnakeAIApp(arcade.Window):
 
     def on_draw(self):
         arcade.start_render()
-        # Dessiner tous les jeux
-        for i, game in enumerate(self.games):
-            # Dessiner le cadre du meilleur jeu
-            if i == self.best_game_index:
-                arcade.draw_rectangle_outline(
-                    game.x_offset + single_frame_size_x / 2,
-                    game.y_offset + single_frame_size_y / 2,
-                    single_frame_size_x - 2,
-                    single_frame_size_y - 2,
-                    COLOR_BEST_GAME_BORDER,
-                    border_width=5
-                )
+        # Dessiner les jeux sélectionnés
+        for index in self.display_indices:
+            game = self.games[index]
 
             # Dessiner les murs (bordures blanches)
             arcade.draw_rectangle_outline(
                 game.x_offset + single_frame_size_x / 2,
-                game.y_offset + single_frame_size_y / 2,
+                single_frame_size_y / 2 + 40,  # Décalage de 40 pour l'espace en haut
                 single_frame_size_x,
                 single_frame_size_y,
                 COLOR_WALL_BORDER,
                 border_width=2
             )
 
+            # Dessiner les murs (pour le fond des jeux non affichés, si nécessaire)
+            # ...
+
             # Dessiner le serpent
             for pos in game.snake_body:
-                arcade.draw_rectangle_filled(pos[0] + grid_size / 2, pos[1] + grid_size / 2, grid_size, grid_size, COLOR_SNAKE)
+                arcade.draw_rectangle_filled(
+                    pos[0] + grid_size / 2,
+                    pos[1] + grid_size / 2 + 40,  # Décalage de 40 pour l'espace en haut
+                    grid_size,
+                    grid_size,
+                    COLOR_SNAKE
+                )
             # Dessiner la nourriture
-            arcade.draw_rectangle_filled(game.food_pos[0] + grid_size / 2, game.food_pos[1] + grid_size / 2, grid_size, grid_size, COLOR_FOOD)
+            arcade.draw_rectangle_filled(
+                game.food_pos[0] + grid_size / 2,
+                game.food_pos[1] + grid_size / 2 + 40,  # Décalage de 40 pour l'espace en haut
+                grid_size,
+                grid_size,
+                COLOR_FOOD
+            )
             # Afficher le score
-            arcade.draw_text(f"Score : {game.score}", game.x_offset + 10, game.y_offset + single_frame_size_y - 20,
-                             COLOR_TEXT, 12)
+            arcade.draw_text(
+                f"Score : {game.score}",
+                game.x_offset + 10,
+                game.y_offset + single_frame_size_y - 20 + 40,
+                COLOR_TEXT,
+                12
+            )
 
             # Afficher le temps restant
-            arcade.draw_text(f"Temps restant : {int(game.time_remaining)}s",
-                             game.x_offset + 10, game.y_offset + single_frame_size_y - 40,
-                             COLOR_TEXT, 12)
+            arcade.draw_text(
+                f"Temps restant : {int(game.time_remaining)}s",
+                game.x_offset + 10,
+                game.y_offset + single_frame_size_y - 40 + 40,
+                COLOR_TEXT,
+                12
+            )
 
             # Afficher la récompense totale
-            arcade.draw_text(f"Récompense totale : {round(game.reward_total, 2)}",
-                             game.x_offset + 10, game.y_offset + single_frame_size_y - 60,
-                             COLOR_TEXT, 12)
+            arcade.draw_text(
+                f"Récompense totale : {round(game.reward_total, 2)}",
+                game.x_offset + 10,
+                game.y_offset + single_frame_size_y - 60 + 40,
+                COLOR_TEXT,
+                12
+            )
 
-            # Indicateur de récompense/punition
-            if game.last_reward > 0:
-                arcade.draw_circle_filled(game.x_offset + single_frame_size_x - 20,
-                                          game.y_offset + single_frame_size_y - 20,
-                                          10, COLOR_REWARD_POSITIVE)
-            elif game.last_reward < 0:
-                arcade.draw_circle_filled(game.x_offset + single_frame_size_x - 20,
-                                          game.y_offset + single_frame_size_y - 20,
-                                          10, COLOR_REWARD_NEGATIVE)
+            # Dessiner le cercle vert ou rouge basé sur la dernière récompense
+            circle_radius = 10
+            circle_x = game.x_offset + single_frame_size_x - 20  # Position à droite du jeu
+            circle_y = game.y_offset + single_frame_size_y - 20 + 40  # Position en bas du jeu
+            if game.last_reward >= 0:
+                circle_color = COLOR_POSITIVE_CIRCLE
+            else:
+                circle_color = COLOR_NEGATIVE_CIRCLE
+            arcade.draw_circle_filled(circle_x, circle_y, circle_radius, circle_color)
 
-            # Dessiner la trajectoire choisie
-            direction_vectors = {
-                'RIGHT': (grid_size, 0),
-                'DOWN': (0, -grid_size),
-                'LEFT': (-grid_size, 0),
-                'UP': (0, grid_size)
-            }
-            dx, dy = direction_vectors[game.direction]
-            start_x = game.snake_pos[0] + grid_size / 2
-            start_y = game.snake_pos[1] + grid_size / 2
-            end_x = start_x + dx
-            end_y = start_y + dy
-            arcade.draw_line(start_x, start_y, end_x, end_y, COLOR_TRAJECTORY, 2)
+        # Afficher les informations en haut de la fenêtre
+        # Génération et Meilleur Score côte à côte
+        arcade.draw_text(
+            f"Génération : {self.generation}",
+            self.screen_width / 4,
+            self.screen_height - 30,
+            COLOR_TEXT,
+            20,
+            anchor_x="center"
+        )
+        arcade.draw_text(
+            f"Meilleur Score : {self.best_score}",
+            3 * self.screen_width / 4,
+            self.screen_height - 30,
+            COLOR_TEXT,
+            20,
+            anchor_x="center"
+        )
 
-        # Afficher la génération en haut au centre de la fenêtre
-        arcade.draw_text(f"Génération : {self.generation}",
-                         self.width // 2, self.height - 30,
-                         COLOR_TEXT, 20, anchor_x="center")
-
-        # Afficher le meilleur score atteint jusqu'à présent
-        arcade.draw_text(f"Meilleur Score : {self.best_score}",
-                         self.width // 2, self.height - 60,
-                         COLOR_TEXT, 16, anchor_x="center")
+        # Nombre de Parties et Parties en Vie côte à côte
+        games_alive = sum(not flag for flag in self.done_flags)
+        arcade.draw_text(
+            f"Nombre de Parties : {self.num_games}",
+            self.screen_width / 4,
+            self.screen_height - 60,
+            COLOR_TEXT,
+            16,
+            anchor_x="center"
+        )
+        arcade.draw_text(
+            f"Parties en Vie : {games_alive}",
+            3 * self.screen_width / 4,
+            self.screen_height - 60,
+            COLOR_TEXT,
+            16,
+            anchor_x="center"
+        )
 
     def on_update(self, delta_time):
-        # Jouer les parties
-        if not all(self.done_flags):
-            for i, game in enumerate(self.games):
-                if not self.done_flags[i]:
-                    reward, done, score = game.play_step(delta_time, current_generation=self.generation)
-                    self.done_flags[i] = done
-        else:
+        # Jouer toutes les parties (affichées ou non)
+        for i, game in enumerate(self.games):
+            if not self.done_flags[i]:
+                reward, done, score = game.play_step(delta_time, current_generation=self.generation)
+                self.done_flags[i] = done
+
+        # Vérifier si toutes les parties sont terminées
+        if all(self.done_flags):
             # Entraîner l'agent une fois après avoir joué toutes les parties
             self.agent.replay()
 
@@ -521,25 +603,17 @@ class SnakeAIApp(arcade.Window):
             max_reward = max(rewards)
             avg_score = sum(scores) / len(scores)
             max_score = max(scores)
-            deaths = len([1 for game in self.games if game.score == 0])
 
             generation_time = time.time() - self.generation_start_time
 
-            print(f"Récompenses des jeux : {rewards}")
-            print(f"Scores des jeux : {scores}")
-            print(f"Récompense moyenne : {avg_reward}")
-            print(f"Récompense maximale : {max_reward}")
-            print(f"Score moyen de la génération : {avg_score}")
-            print(f"Meilleur score de la génération : {max_score}")
-            print(f"Morts : {deaths}")
-            print(f"Temps pour la génération : {generation_time} secondes")
+            print(f"Génération {self.generation} : Récompense moyenne = {avg_reward}, Score max = {max_score}, Temps = {generation_time}s")
 
             # Mettre à jour le meilleur score global si nécessaire
             if max_score > self.best_score:
                 self.best_score = max_score
 
             # Identifier l'index du meilleur jeu
-            self.best_game_index = scores.index(max_score)
+            self.best_game_index = rewards.index(max_reward) if max_reward > 0 else 0
 
             # Enregistrer les récompenses moyennes et maximales dans TensorBoard
             if writer:
@@ -547,7 +621,6 @@ class SnakeAIApp(arcade.Window):
                 writer.add_scalar('Récompense/maximale', max_reward, self.generation)
                 writer.add_scalar('Score/moyen', avg_score, self.generation)
                 writer.add_scalar('Score/maximal', max_score, self.generation)
-                writer.add_scalar('Morts', deaths, self.generation)
                 writer.add_scalar('Temps/génération', generation_time, self.generation)
 
             # Mettre à jour les paramètres de l'agent
@@ -557,8 +630,6 @@ class SnakeAIApp(arcade.Window):
             self.generation += 1
             self.done_flags = [False] * len(self.games)
             for game in self.games:
-                game.reward_total = 0
-                game.last_reward = 0
                 game.reset()
 
             # Redémarrer le temps pour la nouvelle génération
