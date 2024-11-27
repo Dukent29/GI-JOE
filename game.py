@@ -28,12 +28,12 @@ grid_height = single_frame_size_y // grid_size
 # --- Hyperparamètres ---
 difficulty = 0.05  # Temps en secondes entre chaque mise à jour (20 FPS)
 max_memory_size = 100000
-batch_size = 64
-gamma = 0.95
+batch_size = 128  # Augmentation de la taille du batch
+gamma = 0.99  # Augmentation du facteur de discount
 epsilon_start = 1.0
-epsilon_decay = 0.995
-min_epsilon = 0.01
-learning_rate = 0.001
+epsilon_decay = 0.99  # Décroissance plus lente
+min_epsilon = 0.05  # Augmentation de la valeur minimale d'epsilon
+learning_rate = 0.0005  # Réduction du taux d'apprentissage
 target_update = 10
 
 # --- Taille de la vue du serpent ---
@@ -101,16 +101,21 @@ class DQNAgent:
         self.step_count = 0  # Compteur pour TensorBoard
 
     def build_model(self):
-        # Nouveau modèle avec CNN pour traiter la grille
+        # Nouveau modèle avec CNN plus profond et Batch Normalization
         model = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),  # Entrée : 3 canaux (mur, corps, nourriture)
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),  # Augmentation des filtres
+            nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),  # Troisième couche
+            nn.BatchNorm2d(128),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(32 * view_size * view_size, 128),
+            nn.Linear(128 * view_size * view_size, 256),  # Augmentation des neurones
             nn.ReLU(),
-            nn.Linear(128, 3)  # Sortie : 3 actions possibles
+            nn.Linear(256, 3)  # Sortie : 3 actions possibles
         )
         return model
 
@@ -152,10 +157,11 @@ class DQNAgent:
             Q_new[dones] = 0.0
             target = rewards + gamma * Q_new
 
-        # Calcul de la perte et optimisation
+        # Calcul de la perte et optimisation avec Gradient Clipping
         loss = self.criterion(pred, target)
         self.optimizer.zero_grad()
         loss.backward()
+        nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)  # Gradient Clipping
         self.optimizer.step()
 
         # Enregistrer la perte dans TensorBoard
@@ -175,10 +181,11 @@ class DQNAgent:
                 Q_new = torch.tensor([[reward]], device=self.device)
         target[0][action] = Q_new
 
-        # Calcul de la perte et optimisation
+        # Calcul de la perte et optimisation avec Gradient Clipping
         loss = self.criterion(self.model(state0), target)
         self.optimizer.zero_grad()
         loss.backward()
+        nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)  # Gradient Clipping
         self.optimizer.step()
 
         # Enregistrer la perte dans TensorBoard
@@ -259,7 +266,7 @@ class SnakeGameAI:
 
     def get_state(self):
         # Créer une grille centrée sur la tête du serpent
-        state = np.zeros((3, view_size, view_size), dtype=int)  # 3 canaux : mur, corps, nourriture
+        state = np.zeros((3, view_size, view_size), dtype=float)  # 3 canaux : mur, corps, nourriture
         center = view_size // 2
 
         for i in range(view_size):
@@ -270,11 +277,11 @@ class SnakeGameAI:
                 # Vérifier les limites du cadre
                 if x < self.x_offset or x >= self.x_offset + single_frame_size_x or \
                         y < self.y_offset or y >= self.y_offset + single_frame_size_y:
-                    state[0, i, j] = 1  # Mur
+                    state[0, i, j] = 1.0  # Mur
                 elif [x, y] in self.snake_body[1:]:
-                    state[1, i, j] = 1  # Corps du serpent
+                    state[1, i, j] = 1.0  # Corps du serpent
                 elif [x, y] == self.food_pos:
-                    state[2, i, j] = 1  # Nourriture
+                    state[2, i, j] = 1.0  # Nourriture
 
         return state
 
@@ -303,11 +310,8 @@ class SnakeGameAI:
         # Calculer la nouvelle distance à la nourriture
         new_distance = self.calculate_distance_to_food()
 
-        # Récompense si on se rapproche de la nourriture
-        if new_distance < previous_distance:
-            reward += 1
-        else:
-            reward -= 1
+        # Récompense proportionnelle à la réduction de distance
+        reward += (previous_distance - new_distance) / grid_size  # Normalisation
 
         # Pénalité pour chaque mouvement
         reward -= 0.1
@@ -373,7 +377,7 @@ class SnakeAIApp(arcade.Window):
 
         # Calculer la taille de la fenêtre en fonction des parties affichées
         self.screen_width = single_frame_size_x * len(self.display_indices)
-        self.screen_height = single_frame_size_y + 80  # Ajouter de l'espace pour les informations
+        self.screen_height = single_frame_size_y + 120  # Augmentation de l'espace pour les informations
 
         super().__init__(self.screen_width, self.screen_height, "Snake AI - Gestion Automatique", update_rate=difficulty)
         arcade.set_background_color(COLOR_BACKGROUND)
@@ -483,9 +487,6 @@ class SnakeAIApp(arcade.Window):
                 COLOR_WALL_BORDER,
                 border_width=2
             )
-
-            # Dessiner les murs (pour le fond des jeux non affichés, si nécessaire)
-            # ...
 
             # Dessiner le serpent
             for pos in game.snake_body:
