@@ -213,7 +213,7 @@ class SnakeGameAI:
         self.food_spawn = True
         self.direction = 'RIGHT'
         self.score = 0
-        self.time_limit = 40  # Augmenter le temps limite du jeu
+        self.time_limit = 20  # Augmenter le temps limite du jeu
         self.start_time = time.time()
         self.next_direction = self.direction  # Initialiser la prochaine direction
 
