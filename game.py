@@ -16,6 +16,7 @@ import time
 import platform
 import ctypes
 import subprocess
+import os  # Ajout de l'import manquant
 
 # --- Hyperparamètres ---
 difficulty = 0.05  # Temps en secondes entre chaque mise à jour (20 FPS)
@@ -46,7 +47,8 @@ COLOR_FOOD = arcade.color.RED
 COLOR_TEXT = arcade.color.WHITE
 COLOR_REWARD_POSITIVE = arcade.color.GREEN
 COLOR_REWARD_NEGATIVE = arcade.color.RED
-COLOR_BEST_GAME_BORDER = arcade.color.GREEN  # Couleur pour le contour du meilleur jeu
+COLOR_BEST_GAME_BORDER = arcade.color.YELLOW  # Changement pour mieux distinguer
+COLOR_WHITE_BORDER = arcade.color.WHITE  # Nouvelle couleur pour les bordures blanches
 
 # --- Variables Globales pour Empêcher la Mise en Veille ---
 caffeinate_process = None  # Pour macOS
@@ -293,9 +295,9 @@ class SnakeGameAI:
         clock_wise = ['RIGHT', 'DOWN', 'LEFT', 'UP']
         idx = clock_wise.index(self.direction)
 
-        if np.array_equal(action, [1, 0, 0]):
+        if action == 0:
             new_dir = clock_wise[idx]  # Aller tout droit
-        elif np.array_equal(action, [0, 1, 0]):
+        elif action == 1:
             next_idx = (idx + 1) % 4
             new_dir = clock_wise[next_idx]  # Tourner à droite
         else:
@@ -316,8 +318,7 @@ class SnakeGameAI:
     def play_step(self, delta_time, current_generation):
         state_old = self.agent.get_state(self)
         move = self.agent.act(state_old)
-        action = [0, 0, 0]
-        action[move] = 1
+        action = move  # 0: Tout droit, 1: Droite, 2: Gauche
 
         # Calcul de la distance avant le mouvement
         distance_old = np.linalg.norm(np.array(self.snake_pos) - np.array(self.food_pos))
@@ -337,12 +338,12 @@ class SnakeGameAI:
 
         if delta_distance > 0:
             # Déplacement vers le bonbon
-            reduction_steps = int((delta_distance / distance_old) * 10)
+            reduction_steps = int((delta_distance / distance_old) * 10) if distance_old != 0 else 0
             reward += self.app.rewards['deplacement_vers_bonbon'] * reduction_steps
             self.deplacements_vers_bonbon += 1
         elif delta_distance < 0:
             # Déplacement s'éloignant du bonbon
-            increase_steps = int((-delta_distance / distance_old) * 10)
+            increase_steps = int((-delta_distance / distance_old) * 10) if distance_old != 0 else 0
             reward += self.app.penalties['deplacement_eloigne_bonbon'] * increase_steps
             self.deplacements_eloigne_bonbon += 1
         else:
@@ -440,33 +441,9 @@ class SnakeAIApp(arcade.Window):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
-        # Charger le modèle et la mémoire du meilleur agent précédent
-        try:
-            with open("best_agent.pkl", "rb") as f:
-                best_agent_data = pickle.load(f)
-            print("Meilleur agent chargé depuis best_agent.pkl")
-            best_model_state_dict = best_agent_data['model_state_dict']
-            best_memory = best_agent_data['memory']
-            best_epsilon = best_agent_data['epsilon']
-        except FileNotFoundError:
-            print("Aucun agent précédent trouvé, création d'un nouvel agent.")
-            best_model_state_dict = None
-            best_memory = None
-            best_epsilon = epsilon_start
-
-        # Initialiser l'agent
-        if best_model_state_dict is not None:
-            self.agent = DQNAgent(model=None, memory=None, epsilon=best_epsilon, device=self.device)
-            self.agent.model.load_state_dict(best_model_state_dict)
-            self.agent.update_target_model()
-            if best_memory is not None:
-                self.agent.memory = deque(best_memory, maxlen=max_memory_size)
-        else:
-            self.agent = DQNAgent(device=self.device)
-
+        # Initialiser les variables de génération et de meilleur score
         self.generation = 0
         self.best_score = 0  # Meilleur score atteint jusqu'à présent
-        self.best_game_index = None  # Index du meilleur jeu de la génération
 
         # Définir les récompenses et pénalités initiales
         self.rewards = {
@@ -489,6 +466,34 @@ class SnakeAIApp(arcade.Window):
         self.target_deplacements_vers_bonbon = 10
         self.target_deplacements_eloigne_bonbon = 2
 
+        # Charger le modèle, la mémoire, la génération et le meilleur score du meilleur agent précédent
+        try:
+            with open("best_agent.pkl", "rb") as f:
+                best_agent_data = pickle.load(f)
+            print("Meilleur agent chargé depuis best_agent.pkl")
+            best_model_state_dict = best_agent_data['model_state_dict']
+            best_memory = best_agent_data['memory']
+            best_epsilon = best_agent_data['epsilon']
+            loaded_generation = best_agent_data.get('generation', 0)
+            loaded_best_score = best_agent_data.get('best_score', 0)
+            self.generation = loaded_generation
+            self.best_score = loaded_best_score
+        except FileNotFoundError:
+            print("Aucun agent précédent trouvé, création d'un nouvel agent.")
+            best_model_state_dict = None
+            best_memory = None
+            best_epsilon = epsilon_start
+
+        # Initialiser l'agent
+        if best_model_state_dict is not None:
+            self.agent = DQNAgent(model=None, memory=None, epsilon=best_epsilon, device=self.device)
+            self.agent.model.load_state_dict(best_model_state_dict)
+            self.agent.update_target_model()
+            if best_memory is not None:
+                self.agent.memory = deque(best_memory, maxlen=max_memory_size)
+        else:
+            self.agent = DQNAgent(device=self.device)
+
         # Créer les jeux
         self.games = []
         for row in range(rows):
@@ -500,19 +505,32 @@ class SnakeAIApp(arcade.Window):
 
         self.done_flags = [False] * len(self.games)
 
+        # Charger le meilleur score si disponible
+        self.best_game_index = None  # Index du meilleur jeu de la génération
+
     def on_draw(self):
         arcade.start_render()
         # Dessiner tous les jeux
         for i, game in enumerate(self.games):
-            # Dessiner le cadre du meilleur jeu
+            # Dessiner une bordure blanche autour de chaque jeu
+            arcade.draw_rectangle_outline(
+                game.x_offset + single_frame_size_x / 2,
+                game.y_offset + single_frame_size_y / 2,
+                single_frame_size_x,
+                single_frame_size_y,
+                COLOR_WHITE_BORDER,
+                border_width=2
+            )
+
+            # Dessiner le cadre du meilleur jeu avec une bordure spéciale
             if i == self.best_game_index:
                 arcade.draw_rectangle_outline(
                     game.x_offset + single_frame_size_x / 2,
                     game.y_offset + single_frame_size_y / 2,
-                    single_frame_size_x - 2,
-                    single_frame_size_y - 2,
+                    single_frame_size_x - 4,
+                    single_frame_size_y - 4,
                     COLOR_BEST_GAME_BORDER,
-                    border_width=5
+                    border_width=4
                 )
 
             # Dessiner le serpent
@@ -543,6 +561,11 @@ class SnakeAIApp(arcade.Window):
                 arcade.draw_circle_filled(game.x_offset + single_frame_size_x - 20,
                                           game.y_offset + single_frame_size_y - 20,
                                           10, COLOR_REWARD_NEGATIVE)
+            else:
+                # Si la dernière récompense est neutre, dessiner un cercle gris
+                arcade.draw_circle_filled(game.x_offset + single_frame_size_x - 20,
+                                          game.y_offset + single_frame_size_y - 20,
+                                          10, arcade.color.GRAY)
 
         # Afficher la génération en haut au centre de la fenêtre
         arcade.draw_text(f"Génération: {self.generation}",
@@ -594,6 +617,43 @@ class SnakeAIApp(arcade.Window):
             writer.add_scalar('Reward/max', max_reward, self.generation)
             writer.add_scalar('Score/max', max_score, self.generation)
 
+            # Sauvegarder des statistiques détaillées dans TensorBoard
+            total_bonbons = sum(game.bonbons_manges for game in self.games)
+            avg_bonbons = total_bonbons / len(self.games)
+            avg_interval = np.mean([np.mean(game.intervalles_bonbons) if game.intervalles_bonbons else self.target_avg_interval
+                                    for game in self.games])
+            total_proximite_danger = sum(game.proximite_danger for game in self.games)
+            avg_proximite_danger = total_proximite_danger / len(self.games)
+            total_deplacements_vers = sum(game.deplacements_vers_bonbon for game in self.games)
+            total_deplacements_eloigne = sum(game.deplacements_eloigne_bonbon for game in self.games)
+
+            writer.add_scalar('Stats/Total_bonbons', total_bonbons, self.generation)
+            writer.add_scalar('Stats/Average_bonbons', avg_bonbons, self.generation)
+            writer.add_scalar('Stats/Average_interval_between_bonbons', avg_interval, self.generation)
+            writer.add_scalar('Stats/Total_proximity_danger', total_proximite_danger, self.generation)
+            writer.add_scalar('Stats/Average_proximity_danger', avg_proximite_danger, self.generation)
+            writer.add_scalar('Stats/Total_deplacements_vers_bonbon', total_deplacements_vers, self.generation)
+            writer.add_scalar('Stats/Total_deplacements_eloigne_bonbon', total_deplacements_eloigne, self.generation)
+            writer.add_scalar('Stats/Deplacements_inutiles', sum(game.deplacements_inutiles for game in self.games), self.generation)
+
+            # Ajouter les dynamiques des récompenses et pénalités
+            writer.add_scalar('Rewards/manger_bonbon', self.rewards['manger_bonbon'], self.generation)
+            writer.add_scalar('Rewards/intervalle_bonbon', self.rewards['intervalle_bonbon'], self.generation)
+            writer.add_scalar('Rewards/deplacement_vers_bonbon', self.rewards['deplacement_vers_bonbon'], self.generation)
+            writer.add_scalar('Rewards/deplacement', self.rewards['deplacement'], self.generation)
+            writer.add_scalar('Penalties/proximite_danger', self.penalties['proximite_danger'], self.generation)
+            writer.add_scalar('Penalties/deplacement_eloigne_bonbon', self.penalties['deplacement_eloigne_bonbon'], self.generation)
+            writer.add_scalar('Penalties/collision', self.penalties['collision'], self.generation)
+            writer.add_scalar('Penalties/temps_expire', self.penalties['temps_expire'], self.generation)
+
+            # Enregistrer les métriques dans TensorBoard
+            writer.add_scalar('Generation/Average_bonbons', avg_bonbons, self.generation)
+            writer.add_scalar('Generation/Average_interval', avg_interval, self.generation)
+            writer.add_scalar('Generation/Average_proximity_danger', avg_proximite_danger, self.generation)
+            writer.add_scalar('Generation/Total_deplacements_vers_bonbon', total_deplacements_vers, self.generation)
+            writer.add_scalar('Generation/Total_deplacements_eloigne_bonbon', total_deplacements_eloigne, self.generation)
+            writer.add_scalar('Generation/Deplacements_inutiles', sum(game.deplacements_inutiles for game in self.games), self.generation)
+
             # Ajuster les récompenses et pénalités automatiquement
             self.adjust_rewards()
 
@@ -603,14 +663,24 @@ class SnakeAIApp(arcade.Window):
             best_epsilon = max(min_epsilon, self.agent.epsilon * epsilon_decay)
             self.agent.epsilon = best_epsilon
 
-            # Sauvegarder l'agent partagé
+            # Sauvegarder l'agent partagé avec génération et meilleur score
             with open("best_agent.pkl", "wb") as f:
                 pickle.dump({
                     'model_state_dict': best_model_state_dict,
                     'memory': best_memory,
-                    'epsilon': best_epsilon
+                    'epsilon': best_epsilon,
+                    'generation': self.generation,
+                    'best_score': self.best_score
                 }, f)
             print("Meilleur agent sauvegardé dans best_agent.pkl")
+
+            # Sauvegarder les statistiques détaillées
+            writer.add_scalar('Stats/Generation', self.generation, self.generation)
+            writer.add_scalar('Stats/Best_score', self.best_score, self.generation)
+
+            # Sauvegarder le meilleur score dans un fichier séparé pour une récupération rapide
+            with open("best_score.txt", "w") as f:
+                f.write(str(self.best_score))
 
             # Préparer la prochaine génération
             self.generation += 1
@@ -663,24 +733,26 @@ class SnakeAIApp(arcade.Window):
             print("Diminution de la pénalité pour proximité dangereuse")
 
         # Ajuster la récompense pour les déplacements vers le bonbon
-        if total_deplacements_vers < self.target_deplacements_vers_bonbon * len(self.games):
+        expected_deplacements_vers = self.target_deplacements_vers_bonbon * len(self.games)
+        if total_deplacements_vers < expected_deplacements_vers:
             self.rewards['deplacement_vers_bonbon'] = min(self.rewards['deplacement_vers_bonbon'] + 2, 20)
             print("Augmentation de la récompense pour les déplacements vers le bonbon")
-        elif total_deplacements_vers > self.target_deplacements_vers_bonbon * len(self.games):
+        elif total_deplacements_vers > expected_deplacements_vers:
             self.rewards['deplacement_vers_bonbon'] = max(self.rewards['deplacement_vers_bonbon'] - 2, 5)
             print("Diminution de la récompense pour les déplacements vers le bonbon")
 
         # Ajuster la pénalité pour les déplacements s'éloignant du bonbon
-        if total_deplacements_eloigne > self.target_deplacements_eloigne_bonbon * len(self.games):
+        expected_deplacements_eloigne = self.target_deplacements_eloigne_bonbon * len(self.games)
+        if total_deplacements_eloigne > expected_deplacements_eloigne:
             self.penalties['deplacement_eloigne_bonbon'] = max(self.penalties['deplacement_eloigne_bonbon'] - 2, -50)
             print("Augmentation de la pénalité pour les déplacements éloignés du bonbon")
-        elif total_deplacements_eloigne < self.target_deplacements_eloigne_bonbon * len(self.games):
+        elif total_deplacements_eloigne < expected_deplacements_eloigne:
             self.penalties['deplacement_eloigne_bonbon'] = min(self.penalties['deplacement_eloigne_bonbon'] + 2, -5)
             print("Diminution de la pénalité pour les déplacements éloignés du bonbon")
 
     def on_close(self):
         print("Fermeture du jeu, sauvegarde en cours...")
-        # Sauvegarder l'agent partagé
+        # Sauvegarder l'agent partagé avec génération et meilleur score
         best_model_state_dict = self.agent.model.state_dict()
         best_memory = self.agent.memory
         best_epsilon = self.agent.epsilon
@@ -688,10 +760,16 @@ class SnakeAIApp(arcade.Window):
             pickle.dump({
                 'model_state_dict': best_model_state_dict,
                 'memory': best_memory,
-                'epsilon': best_epsilon
+                'epsilon': best_epsilon,
+                'generation': self.generation,
+                'best_score': self.best_score
             }, f)
-        print("Meilleur agent sauvegardé. Programme terminé.")
+        print("Meilleur agent sauvegardé dans best_agent.pkl")
         writer.close()
+
+        # Sauvegarder le meilleur score dans un fichier séparé
+        with open("best_score.txt", "w") as f:
+            f.write(str(self.best_score))
 
         # Permettre la mise en veille du système
         allow_sleep()
@@ -700,7 +778,15 @@ class SnakeAIApp(arcade.Window):
 
 # --- Fonction principale ---
 def main():
+    # Vérifier si "best_score.txt" existe pour charger le meilleur score
+    if os.path.exists("best_score.txt"):
+        with open("best_score.txt", "r") as f:
+            best_score = int(f.read())
+    else:
+        best_score = 0
+
     app = SnakeAIApp()
+    app.best_score = best_score  # Assigner le meilleur score chargé
     arcade.run()
 
 if __name__ == '__main__':
