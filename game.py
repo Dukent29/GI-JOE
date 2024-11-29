@@ -1,5 +1,5 @@
 """
-Snake AI avec DQN et LSTM
+Snake AI avec DQN et LSTM (passage conditionnel basé sur les performances avec ajustement dynamique des récompenses)
 Créé avec Arcade et PyTorch
 """
 
@@ -21,14 +21,32 @@ import os
 # --- Hyperparamètres ---
 difficulty = 0.05  # Temps en secondes entre chaque mise à jour (20 FPS)
 max_memory_size = 100000
-batch_size = 64
+batch_size = 128
 gamma = 0.95
 epsilon_start = 1.0
-epsilon_decay = 0.995
+epsilon_decay = 0.995  # Décroissance plus rapide
 min_epsilon = 0.01
 learning_rate = 0.001
 target_update = 10
-sequence_length = 4  # Longueur des séquences pour le LSTM
+
+# --- Critères pour le passage au LSTM ---
+window_size = 10  # Nombre de générations pour le calcul des moyennes
+score_threshold = 5  # Score moyen minimal pour le passage
+reward_threshold = 50  # Récompense moyenne minimale pour le passage
+loss_threshold = 0.1  # Perte moyenne maximale pour le passage
+success_score = 3  # Score à atteindre pour considérer une partie réussie
+success_rate_threshold = 0.7  # Taux de succès minimal pour le passage
+consistency_threshold = 5  # Nombre de générations consécutives où les critères sont satisfaits
+
+# --- Limites pour les récompenses et pénalités ---
+reward_limits = {
+    'manger_bonbon': (10, 100),
+    'survie': (0.01, 1),
+}
+penalty_limits = {
+    'collision': (-300, -50),
+    'temps_expire': (-50, -10),
+}
 
 # --- Dimensions de la fenêtre ---
 rows = 2
@@ -83,23 +101,56 @@ def allow_sleep():
     elif os_name == "Linux":
         pass
 
-# --- Classes pour le DQN avec LSTM ---
+# --- Classes pour le DQN ---
 class DQNAgent:
-    def __init__(self, model=None, memory=None, epsilon=epsilon_start, device='cpu'):
+    def __init__(self, model=None, memory=None, epsilon=epsilon_start, device='cpu', use_lstm=False):
         self.memory = deque(maxlen=max_memory_size) if memory is None else memory
         self.epsilon = epsilon
         self.device = device
-        self.model = self.build_model().to(self.device) if model is None else model.to(self.device)
-        self.target_model = self.build_model().to(self.device)
+        self.use_lstm = use_lstm  # Indicateur pour utiliser le LSTM
+
+        # Choisir le modèle en fonction de use_lstm
+        if not self.use_lstm:
+            self.model = self.build_simple_model().to(self.device) if model is None else model.to(self.device)
+            self.target_model = self.build_simple_model().to(self.device)
+        else:
+            self.model = self.build_lstm_model().to(self.device) if model is None else model.to(self.device)
+            self.target_model = self.build_lstm_model().to(self.device)
+
         if model is not None:
             self.target_model.load_state_dict(self.model.state_dict())
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
         self.criterion = nn.MSELoss()
         self.step_count = 0  # Compteur pour TensorBoard
-        self.hidden_state = None  # État caché initial du LSTM
         self.q_values = None  # Initialiser q_values à None
+        self.hidden_state = None  # Pour le LSTM
 
-    def build_model(self):
+    def build_simple_model(self):
+        class DQNNet(nn.Module):
+            def __init__(self, input_size, hidden_size, output_size):
+                super(DQNNet, self).__init__()
+                self.fc1 = nn.Linear(input_size, hidden_size)
+                self.relu1 = nn.ReLU()
+                self.fc2 = nn.Linear(hidden_size, hidden_size)
+                self.relu2 = nn.ReLU()
+                self.fc3 = nn.Linear(hidden_size, output_size)
+
+            def forward(self, x):
+                x = self.fc1(x)
+                x = self.relu1(x)
+                x = self.fc2(x)
+                x = self.relu2(x)
+                x = self.fc3(x)
+                return x
+
+        input_size = 16  # Taille de l'état
+        hidden_size = 128
+        output_size = 3  # Nombre d'actions possibles
+
+        model = DQNNet(input_size, hidden_size, output_size)
+        return model
+
+    def build_lstm_model(self):
         class LSTMNet(nn.Module):
             def __init__(self, input_size, hidden_size, output_size):
                 super(LSTMNet, self).__init__()
@@ -177,108 +228,183 @@ class DQNAgent:
         return x_offset <= pos[0] < x_offset + single_frame_size_x and y_offset <= pos[1] < y_offset + single_frame_size_y
 
     def remember(self, state, action, reward, next_state, done):
-        # Stocker une séquence d'états pour le LSTM
-        if hasattr(self, 'state_sequence'):
-            self.state_sequence.append(state)
-            self.action_sequence.append(action)
-            self.reward_sequence.append(reward)
-            self.next_state_sequence.append(next_state)
-            self.done_sequence.append(done)
-            if len(self.state_sequence) == sequence_length:
-                self.memory.append((
-                    list(self.state_sequence),
-                    list(self.action_sequence),
-                    list(self.reward_sequence),
-                    list(self.next_state_sequence),
-                    list(self.done_sequence)
-                ))
-                self.state_sequence.pop(0)
-                self.action_sequence.pop(0)
-                self.reward_sequence.pop(0)
-                self.next_state_sequence.pop(0)
-                self.done_sequence.pop(0)
+        if not self.use_lstm:
+            self.memory.append((state, action, reward, next_state, done))
         else:
-            self.state_sequence = [state]
-            self.action_sequence = [action]
-            self.reward_sequence = [reward]
-            self.next_state_sequence = [next_state]
-            self.done_sequence = [done]
+            # Pour le LSTM, on peut utiliser des séquences
+            if hasattr(self, 'state_sequence'):
+                self.state_sequence.append(state)
+                self.action_sequence.append(action)
+                self.reward_sequence.append(reward)
+                self.next_state_sequence.append(next_state)
+                self.done_sequence.append(done)
+                if len(self.state_sequence) == 4:  # Longueur de séquence choisie
+                    self.memory.append((
+                        list(self.state_sequence),
+                        list(self.action_sequence),
+                        list(self.reward_sequence),
+                        list(self.next_state_sequence),
+                        list(self.done_sequence)
+                    ))
+                    self.state_sequence.pop(0)
+                    self.action_sequence.pop(0)
+                    self.reward_sequence.pop(0)
+                    self.next_state_sequence.pop(0)
+                    self.done_sequence.pop(0)
+            else:
+                self.state_sequence = [state]
+                self.action_sequence = [action]
+                self.reward_sequence = [reward]
+                self.next_state_sequence = [next_state]
+                self.done_sequence = [done]
 
     def act(self, state):
-        state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0).unsqueeze(0).to(self.device)
-        if random.uniform(0, 1) < self.epsilon:
-            # Action aléatoire (exploration)
-            self.hidden_state = None  # Réinitialiser l'état caché pour l'action aléatoire
-            with torch.no_grad():
-                prediction, _ = self.model(state0, self.hidden_state)
-            action = random.randint(0, 2)
+        if not self.use_lstm:
+            state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+            if random.uniform(0, 1) < self.epsilon:
+                # Action aléatoire (exploration)
+                with torch.no_grad():
+                    prediction = self.model(state0)
+                action = random.randint(0, 2)
+            else:
+                # Action basée sur le modèle (exploitation)
+                with torch.no_grad():
+                    prediction = self.model(state0)
+                action = torch.argmax(prediction).item()
+            self.q_values = prediction.cpu().numpy()[0]
+            return action
         else:
-            # Action basée sur le modèle (exploitation)
-            with torch.no_grad():
-                prediction, self.hidden_state = self.model(state0, self.hidden_state)
-            action = torch.argmax(prediction).item()
-        self.q_values = prediction.cpu().numpy()[0]
-        return action
+            state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0).unsqueeze(0).to(self.device)
+            if random.uniform(0, 1) < self.epsilon:
+                # Action aléatoire (exploration)
+                self.hidden_state = None  # Réinitialiser l'état caché pour l'action aléatoire
+                with torch.no_grad():
+                    prediction, _ = self.model(state0, self.hidden_state)
+                action = random.randint(0, 2)
+            else:
+                # Action basée sur le modèle (exploitation)
+                with torch.no_grad():
+                    prediction, self.hidden_state = self.model(state0, self.hidden_state)
+                action = torch.argmax(prediction).item()
+            self.q_values = prediction.cpu().numpy()[0]
+            return action
 
     def replay(self):
         if len(self.memory) < batch_size:
             return
-        minibatch = random.sample(self.memory, batch_size)
-        states_seq, actions_seq, rewards_seq, next_states_seq, dones_seq = zip(*minibatch)
 
-        # Convertir en tenseurs
-        states_seq = torch.tensor(states_seq, dtype=torch.float).to(self.device)
-        actions_seq = torch.tensor(actions_seq, dtype=torch.long).to(self.device)
-        rewards_seq = torch.tensor(rewards_seq, dtype=torch.float).to(self.device)
-        next_states_seq = torch.tensor(next_states_seq, dtype=torch.float).to(self.device)
-        dones_seq = torch.tensor(dones_seq, dtype=torch.float).to(self.device)
+        if not self.use_lstm:
+            minibatch = random.sample(self.memory, batch_size)
+            states_mb, actions_mb, rewards_mb, next_states_mb, dones_mb = zip(*minibatch)
 
-        h0 = None  # Initialiser l'état caché
+            # Convertir en tenseurs
+            states_mb = torch.tensor(states_mb, dtype=torch.float).to(self.device)
+            actions_mb = torch.tensor(actions_mb, dtype=torch.long).unsqueeze(1).to(self.device)
+            rewards_mb = torch.tensor(rewards_mb, dtype=torch.float).unsqueeze(1).to(self.device)
+            next_states_mb = torch.tensor(next_states_mb, dtype=torch.float).to(self.device)
+            dones_mb = torch.tensor(dones_mb, dtype=torch.float).unsqueeze(1).to(self.device)
 
-        pred, _ = self.model(states_seq, h0)
-        target_pred, _ = self.target_model(next_states_seq, h0)
+            pred = self.model(states_mb).gather(1, actions_mb)
+            target_next = self.target_model(next_states_mb).detach().max(1)[0].unsqueeze(1)
+            target = rewards_mb + (1 - dones_mb) * gamma * target_next
 
-        pred = pred.gather(2, actions_seq.unsqueeze(2)).squeeze(2)
+            loss = self.criterion(pred, target)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
 
-        target = rewards_seq + (1 - dones_seq) * gamma * torch.max(target_pred, dim=2)[0]
+            # Enregistrer la perte dans TensorBoard
+            if self.step_count % 10 == 0:
+                writer.add_scalar('Loss/train', loss.item(), self.step_count)
+            self.step_count += 1
 
-        loss = self.criterion(pred, target.detach())
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+            # Stocker la perte pour l'évaluation des critères
+            self.current_loss = loss.item()
+        else:
+            minibatch = random.sample(self.memory, batch_size)
+            states_seq, actions_seq, rewards_seq, next_states_seq, dones_seq = zip(*minibatch)
 
-        # Enregistrer la perte dans TensorBoard
-        if self.step_count % 10 == 0:
-            writer.add_scalar('Loss/train', loss.item(), self.step_count)
-        self.step_count += 1
+            # Convertir en tenseurs
+            states_seq = torch.tensor(states_seq, dtype=torch.float).to(self.device)
+            actions_seq = torch.tensor(actions_seq, dtype=torch.long).to(self.device)
+            rewards_seq = torch.tensor(rewards_seq, dtype=torch.float).to(self.device)
+            next_states_seq = torch.tensor(next_states_seq, dtype=torch.float).to(self.device)
+            dones_seq = torch.tensor(dones_seq, dtype=torch.float).to(self.device)
+
+            h0 = None  # Initialiser l'état caché
+
+            pred, _ = self.model(states_seq, h0)
+            target_pred, _ = self.target_model(next_states_seq, h0)
+
+            pred = pred.gather(2, actions_seq.unsqueeze(2)).squeeze(2)
+            target = rewards_seq + (1 - dones_seq) * gamma * torch.max(target_pred, dim=2)[0]
+
+            loss = self.criterion(pred, target.detach())
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            # Enregistrer la perte dans TensorBoard
+            if self.step_count % 10 == 0:
+                writer.add_scalar('Loss/train', loss.item(), self.step_count)
+            self.step_count += 1
+
+            # Stocker la perte pour l'évaluation des critères
+            self.current_loss = loss.item()
 
     def train_short_memory(self, state, action, reward, next_state, done):
-        # Pour l'entraînement à court terme, nous utilisons des séquences de longueur 1
-        state_seq = torch.tensor([state], dtype=torch.float).unsqueeze(0).to(self.device)
-        action_seq = torch.tensor([[action]], dtype=torch.long).to(self.device)
-        reward_seq = torch.tensor([[reward]], dtype=torch.float).to(self.device)
-        next_state_seq = torch.tensor([next_state], dtype=torch.float).unsqueeze(0).to(self.device)
-        done_seq = torch.tensor([[done]], dtype=torch.float).to(self.device)
+        if not self.use_lstm:
+            state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+            next_state0 = torch.tensor(next_state, dtype=torch.float).unsqueeze(0).to(self.device)
+            action0 = torch.tensor([action], dtype=torch.long).unsqueeze(1).to(self.device)
+            reward0 = torch.tensor([reward], dtype=torch.float).unsqueeze(1).to(self.device)
+            done0 = torch.tensor([done], dtype=torch.float).unsqueeze(1).to(self.device)
 
-        h0 = None  # État caché initial pour l'entraînement
+            pred = self.model(state0).gather(1, action0)
+            target_next = self.target_model(next_state0).detach().max(1)[0].unsqueeze(1)
+            target = reward0 + (1 - done0) * gamma * target_next
 
-        pred, _ = self.model(state_seq, h0)
-        target_pred, _ = self.target_model(next_state_seq, h0)
+            loss = self.criterion(pred, target)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
 
-        pred = pred.gather(2, action_seq.unsqueeze(2)).squeeze(2)
+            # Enregistrer la perte dans TensorBoard
+            if self.step_count % 10 == 0:
+                writer.add_scalar('Loss/train_short_memory', loss.item(), self.step_count)
+            self.step_count += 1
 
-        target = reward_seq + (1 - done_seq) * gamma * torch.max(target_pred, dim=2)[0]
-        target.detach_()
+            # Stocker la perte pour l'évaluation des critères
+            self.current_loss = loss.item()
+        else:
+            # Pour le LSTM, l'entraînement à court terme peut être similaire
+            state_seq = torch.tensor([state], dtype=torch.float).unsqueeze(0).to(self.device)
+            next_state_seq = torch.tensor([next_state], dtype=torch.float).unsqueeze(0).to(self.device)
+            action_seq = torch.tensor([[action]], dtype=torch.long).to(self.device)
+            reward_seq = torch.tensor([[reward]], dtype=torch.float).to(self.device)
+            done_seq = torch.tensor([[done]], dtype=torch.float).to(self.device)
 
-        loss = self.criterion(pred, target)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+            h0 = None  # État caché initial
 
-        # Enregistrer la perte dans TensorBoard
-        if self.step_count % 10 == 0:
-            writer.add_scalar('Loss/train_short_memory', loss.item(), self.step_count)
-        self.step_count += 1
+            pred, _ = self.model(state_seq, h0)
+            target_pred, _ = self.target_model(next_state_seq, h0)
+
+            pred = pred.gather(2, action_seq.unsqueeze(2)).squeeze(2)
+            target = reward_seq + (1 - done_seq) * gamma * torch.max(target_pred, dim=2)[0]
+            target.detach_()
+
+            loss = self.criterion(pred, target)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            # Enregistrer la perte dans TensorBoard
+            if self.step_count % 10 == 0:
+                writer.add_scalar('Loss/train_short_memory', loss.item(), self.step_count)
+            self.step_count += 1
+
+            # Stocker la perte pour l'évaluation des critères
+            self.current_loss = loss.item()
 
 # --- Classe du jeu avec Arcade ---
 class SnakeGameAI:
@@ -393,8 +519,8 @@ class SnakeGameAI:
         self.move(action)
         self.snake_body.insert(0, self.snake_pos[:])
 
-        # Initialisation de la récompense avec la récompense de survie
-        reward = self.app.rewards['survie']
+        # Initialisation de la récompense
+        reward = 0
         done = False
 
         # Vérifier les collisions
@@ -405,16 +531,37 @@ class SnakeGameAI:
             self.last_reward = reward
             return reward, done, self.score
 
+        # Calcul de la distance à la nourriture avant et après le mouvement
+        prev_distance = abs(self.snake_body[1][0] - self.food_pos[0]) + abs(self.snake_body[1][1] - self.food_pos[1])
+        current_distance = abs(self.snake_pos[0] - self.food_pos[0]) + abs(self.snake_pos[1] - self.food_pos[1])
+
         # Vérifier si le serpent a mangé un bonbon
         if self.snake_pos == self.food_pos:
             self.score += 1
+            time_since_last_food = time.time() - self.temps_last_bonbon
+
+            # Récompense pour manger la nourriture
             reward += self.app.rewards['manger_bonbon']
+
+            # Bonus pour avoir atteint la nourriture rapidement
+            if time_since_last_food < 5:
+                reward += 10  # Bonus pour rapidité
+
             self.bonbons_manges += 1
             self.food_spawn = False
             interval = time.time() - self.temps_last_bonbon
             self.intervalles_bonbons.append(interval)
             self.temps_last_bonbon = time.time()
         else:
+            # Récompense ou pénalité pour se rapprocher ou s'éloigner de la nourriture
+            if current_distance < prev_distance:
+                reward += 0.5  # Se rapproche de la nourriture
+            else:
+                reward -= 0.5  # S'éloigne de la nourriture
+
+            # Récompense pour survie
+            reward += self.app.rewards['survie']
+
             # Retirer le dernier segment pour maintenir la taille constante
             self.snake_body.pop()
 
@@ -468,12 +615,12 @@ class SnakeAIApp(arcade.Window):
 
         # Définir les récompenses et pénalités initiales
         self.rewards = {
-            'manger_bonbon': 40,
-            'survie': 0.1
+            'manger_bonbon': 40,  # Récompense de base pour manger la nourriture
+            'survie': 0.1,        # Récompense pour chaque action sans mourir
         }
         self.penalties = {
-            'collision': -150,
-            'temps_expire': -20
+            'collision': -150,    # Pénalité pour collision
+            'temps_expire': -20   # Pénalité si le temps est écoulé
         }
 
         # Charger le modèle, la mémoire, la génération et le meilleur score du meilleur agent précédent
@@ -488,21 +635,23 @@ class SnakeAIApp(arcade.Window):
             loaded_best_score = best_agent_data.get('best_score', 0)
             self.generation = loaded_generation
             self.best_score = loaded_best_score
+            best_use_lstm = best_agent_data.get('use_lstm', False)
         except FileNotFoundError:
             print("Aucun agent précédent trouvé, création d'un nouvel agent.")
             best_model_state_dict = None
             best_memory = None
             best_epsilon = epsilon_start
+            best_use_lstm = False
 
         # Initialiser l'agent
         if best_model_state_dict is not None:
-            self.agent = DQNAgent(model=None, memory=None, epsilon=best_epsilon, device=self.device)
+            self.agent = DQNAgent(model=None, memory=None, epsilon=best_epsilon, device=self.device, use_lstm=best_use_lstm)
             self.agent.model.load_state_dict(best_model_state_dict)
             self.agent.update_target_model()
             if best_memory is not None:
                 self.agent.memory = deque(best_memory, maxlen=max_memory_size)
         else:
-            self.agent = DQNAgent(device=self.device)
+            self.agent = DQNAgent(device=self.device, use_lstm=False)
 
         # Créer les jeux
         self.games = []
@@ -517,6 +666,13 @@ class SnakeAIApp(arcade.Window):
 
         # Charger le meilleur score si disponible
         self.best_game_index = None  # Index du meilleur jeu de la génération
+
+        # Variables pour stocker les métriques
+        self.scores_history = []
+        self.rewards_history = []
+        self.loss_history = []
+        self.success_rates = []
+        self.consistency_count = 0
 
     def on_draw(self):
         arcade.start_render()
@@ -668,6 +824,12 @@ class SnakeAIApp(arcade.Window):
                          self.width // 2, self.height - 60,
                          COLOR_TEXT, 16, anchor_x="center")
 
+        # Indiquer si le LSTM est utilisé
+        model_type = "LSTM" if self.agent.use_lstm else "Feedforward"
+        arcade.draw_text(f"Modèle: {model_type}",
+                         self.width // 2, self.height - 90,
+                         COLOR_TEXT, 16, anchor_x="center")
+
     def clip_line_to_frame(self, x1, y1, x2, y2, x_offset, y_offset):
         # Limiter la ligne aux limites du cadre du jeu
         min_x = x_offset
@@ -718,6 +880,66 @@ class SnakeAIApp(arcade.Window):
         # Dessiner les pointes de la flèche
         arcade.draw_triangle_filled(x_end, y_end, x1, y1, x2, y2, color)
 
+    def adjust_rewards_penalties(self):
+        """
+        Ajuste les récompenses et pénalités en fonction des performances de l'agent.
+        """
+        # Calculer les moyennes sur la fenêtre
+        if len(self.scores_history) >= window_size:
+            avg_score = sum(self.scores_history[-window_size:]) / window_size
+            avg_reward = sum(self.rewards_history[-window_size:]) / window_size
+
+            # Ajustement des récompenses
+            # Par exemple, si l'agent performe bien, réduire les récompenses pour augmenter la difficulté
+            if avg_score > score_threshold:
+                # Réduire les récompenses
+                self.rewards['manger_bonbon'] = max(
+                    reward_limits['manger_bonbon'][0],
+                    self.rewards['manger_bonbon'] * 0.9
+                )
+                self.rewards['survie'] = max(
+                    reward_limits['survie'][0],
+                    self.rewards['survie'] * 0.9
+                )
+            else:
+                # Augmenter les récompenses
+                self.rewards['manger_bonbon'] = min(
+                    reward_limits['manger_bonbon'][1],
+                    self.rewards['manger_bonbon'] * 1.1
+                )
+                self.rewards['survie'] = min(
+                    reward_limits['survie'][1],
+                    self.rewards['survie'] * 1.1
+                )
+
+            # Ajustement des pénalités
+            if avg_score < score_threshold:
+                # Augmenter les pénalités (plus négatives)
+                self.penalties['collision'] = max(
+                    penalty_limits['collision'][0],
+                    self.penalties['collision'] * 1.1
+                )
+                self.penalties['temps_expire'] = max(
+                    penalty_limits['temps_expire'][0],
+                    self.penalties['temps_expire'] * 1.1
+                )
+            else:
+                # Réduire les pénalités (moins négatives)
+                self.penalties['collision'] = min(
+                    penalty_limits['collision'][1],
+                    self.penalties['collision'] * 0.9
+                )
+                self.penalties['temps_expire'] = min(
+                    penalty_limits['temps_expire'][1],
+                    self.penalties['temps_expire'] * 0.9
+                )
+
+            # Enregistrer les nouvelles valeurs dans TensorBoard
+            writer.add_scalar('Rewards/manger_bonbon', self.rewards['manger_bonbon'], self.generation)
+            writer.add_scalar('Rewards/survie', self.rewards['survie'], self.generation)
+            writer.add_scalar('Penalties/collision', self.penalties['collision'], self.generation)
+            writer.add_scalar('Penalties/temps_expire', self.penalties['temps_expire'], self.generation)
+
     def on_update(self, delta_time):
         # Jouer les parties
         if not all(self.done_flags):
@@ -746,6 +968,58 @@ class SnakeAIApp(arcade.Window):
             print(f"Récompense maximale: {max_reward}")
             print(f"Meilleur score de la génération: {max_score}")
 
+            # Enregistrer les métriques
+            self.scores_history.append(avg_reward)
+            self.rewards_history.append(avg_reward)
+            self.loss_history.append(self.agent.current_loss)
+            success_rate = sum([1 for s in scores if s >= success_score]) / len(scores)
+            self.success_rates.append(success_rate)
+
+            # Limiter la taille des historiques
+            if len(self.scores_history) > window_size:
+                self.scores_history.pop(0)
+                self.rewards_history.pop(0)
+                self.loss_history.pop(0)
+                self.success_rates.pop(0)
+
+            # Ajuster les récompenses et pénalités en fonction des performances
+            self.adjust_rewards_penalties()
+
+            # Vérifier les critères pour le passage au LSTM
+            if not self.agent.use_lstm:
+                criteria_met = False
+                if len(self.scores_history) == window_size:
+                    avg_score = sum(self.scores_history) / window_size
+                    avg_reward_window = sum(self.rewards_history) / window_size
+                    avg_loss = sum(self.loss_history) / window_size
+                    avg_success_rate = sum(self.success_rates) / window_size
+
+                    criteria_met = (
+                            avg_score >= score_threshold and
+                            avg_reward_window >= reward_threshold and
+                            avg_loss <= loss_threshold and
+                            avg_success_rate >= success_rate_threshold
+                    )
+
+                    if criteria_met:
+                        self.consistency_count += 1
+                    else:
+                        self.consistency_count = 0
+
+                    print(f"Critères satisfaits : {criteria_met}, Compteur de consistance : {self.consistency_count}")
+
+                    if self.consistency_count >= consistency_threshold:
+                        print("Passage au modèle LSTM.")
+                        self.agent.use_lstm = True
+                        self.agent.model = self.agent.build_lstm_model().to(self.device)
+                        self.agent.target_model = self.agent.build_lstm_model().to(self.device)
+                        # Transférer les poids si possible
+                        # Ici, nous pouvons initialiser les poids du LSTM avec ceux du modèle simple (selon la compatibilité)
+                        self.agent.optimizer = optim.Adam(self.agent.model.parameters(), lr=learning_rate)
+                        self.consistency_count = 0  # Réinitialiser le compteur
+                else:
+                    self.consistency_count = 0
+
             # Mettre à jour le meilleur score global si nécessaire
             if max_score > self.best_score:
                 self.best_score = max_score
@@ -757,23 +1031,25 @@ class SnakeAIApp(arcade.Window):
             writer.add_scalar('Reward/avg', avg_reward, self.generation)
             writer.add_scalar('Reward/max', max_reward, self.generation)
             writer.add_scalar('Score/max', max_score, self.generation)
+            writer.add_scalar('Epsilon', self.agent.epsilon, self.generation)
+            writer.add_scalar('Loss', self.agent.current_loss, self.generation)
+            writer.add_scalar('Success Rate', success_rate, self.generation)
 
-            # Mettre à jour les paramètres de l'agent
-            best_model_state_dict = self.agent.model.state_dict()
-            best_memory = self.agent.memory
-            best_epsilon = max(min_epsilon, self.agent.epsilon * epsilon_decay)
-            self.agent.epsilon = best_epsilon
-
-            # Sauvegarder l'agent partagé avec génération et meilleur score
-            with open("best_agent.pkl", "wb") as f:
-                pickle.dump({
-                    'model_state_dict': best_model_state_dict,
-                    'memory': best_memory,
-                    'epsilon': best_epsilon,
-                    'generation': self.generation,
-                    'best_score': self.best_score
-                }, f)
-            print("Meilleur agent sauvegardé dans best_agent.pkl")
+            # Sauvegarder le modèle si le meilleur score est atteint
+            if max_score >= self.best_score:
+                best_model_state_dict = self.agent.model.state_dict()
+                best_memory = self.agent.memory
+                best_epsilon = self.agent.epsilon
+                with open("best_agent.pkl", "wb") as f:
+                    pickle.dump({
+                        'model_state_dict': best_model_state_dict,
+                        'memory': best_memory,
+                        'epsilon': best_epsilon,
+                        'generation': self.generation,
+                        'best_score': self.best_score,
+                        'use_lstm': self.agent.use_lstm
+                    }, f)
+                print("Meilleur agent sauvegardé dans best_agent.pkl")
 
             # Sauvegarder les statistiques détaillées
             writer.add_scalar('Stats/Generation', self.generation, self.generation)
@@ -782,6 +1058,9 @@ class SnakeAIApp(arcade.Window):
             # Sauvegarder le meilleur score dans un fichier séparé pour une récupération rapide
             with open("best_score.txt", "w") as f:
                 f.write(str(self.best_score))
+
+            # Mettre à jour l'epsilon
+            self.agent.epsilon = max(min_epsilon, self.agent.epsilon * epsilon_decay)
 
             # Préparer la prochaine génération
             self.generation += 1
@@ -801,7 +1080,8 @@ class SnakeAIApp(arcade.Window):
                 'memory': best_memory,
                 'epsilon': best_epsilon,
                 'generation': self.generation,
-                'best_score': self.best_score
+                'best_score': self.best_score,
+                'use_lstm': self.agent.use_lstm
             }, f)
         print("Meilleur agent sauvegardé dans best_agent.pkl")
         writer.close()
