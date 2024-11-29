@@ -96,13 +96,13 @@ class DQNAgent:
         self.step_count = 0  # Compteur pour TensorBoard
 
     def build_model(self):
-        # Réseau de neurones simplifié et optimisé
+        # La taille de l'état est maintenant de 16
         model = nn.Sequential(
-            nn.Linear(11, 64),
+            nn.Linear(16, 128),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(128, 128),
             nn.ReLU(),
-            nn.Linear(64, 3)
+            nn.Linear(128, 3)
         )
         return model
 
@@ -110,51 +110,54 @@ class DQNAgent:
         self.target_model.load_state_dict(self.model.state_dict())
 
     def get_state(self, game):
-        # État du jeu sous forme de tableau normalisé
         head = game.snake_pos
-        point_l = [head[0] - 10, head[1]]
-        point_r = [head[0] + 10, head[1]]
-        point_u = [head[0], head[1] + 10]  # En Arcade, l'axe Y augmente vers le haut
-        point_d = [head[0], head[1] - 10]
 
+        # Directions pour le ray casting
+        directions = [
+            (0, 10),    # Haut
+            (10, 10),   # Haut-Droite
+            (10, 0),    # Droite
+            (10, -10),  # Bas-Droite
+            (0, -10),   # Bas
+            (-10, -10), # Bas-Gauche
+            (-10, 0),   # Gauche
+            (-10, 10)   # Haut-Gauche
+        ]
+
+        # Calcul des distances aux obstacles dans chaque direction
+        obstacle_distances = []
+        max_distance = max(single_frame_size_x, single_frame_size_y) // 10  # Distance maximale possible en cases
+        for dx, dy in directions:
+            distance = 0
+            pos = head.copy()
+            while True:
+                pos[0] += dx
+                pos[1] += dy
+                distance += 1
+                if game.is_collision(pos):
+                    break
+                # Optionnel : inclure la nourriture dans la vision
+                # if pos == game.food_pos:
+                #     break
+            # Normaliser la distance
+            obstacle_distances.append(distance / max_distance)
+
+        # Direction actuelle du serpent
         dir_l = game.direction == 'LEFT'
         dir_r = game.direction == 'RIGHT'
         dir_u = game.direction == 'UP'
         dir_d = game.direction == 'DOWN'
 
-        state = [
-            # Danger tout droit
-            (dir_r and game.is_collision(point_r)) or
-            (dir_l and game.is_collision(point_l)) or
-            (dir_u and game.is_collision(point_u)) or
-            (dir_d and game.is_collision(point_d)),
-
-            # Danger à droite
-            (dir_u and game.is_collision(point_r)) or
-            (dir_d and game.is_collision(point_l)) or
-            (dir_l and game.is_collision(point_u)) or
-            (dir_r and game.is_collision(point_d)),
-
-            # Danger à gauche
-            (dir_d and game.is_collision(point_r)) or
-            (dir_u and game.is_collision(point_l)) or
-            (dir_r and game.is_collision(point_u)) or
-            (dir_l and game.is_collision(point_d)),
-
-            # Direction de mouvement
-            dir_l,
-            dir_r,
-            dir_u,
-            dir_d,
-
-            # Nourriture relative à la position du serpent
-            game.food_pos[0] < game.snake_pos[0],  # nourriture à gauche
-            game.food_pos[0] > game.snake_pos[0],  # nourriture à droite
-            game.food_pos[1] > game.snake_pos[1],  # nourriture en haut
-            game.food_pos[1] < game.snake_pos[1]   # nourriture en bas
+        # Position relative de la nourriture
+        food_direction = [
+            game.food_pos[0] < game.snake_pos[0],  # Nourriture à gauche
+            game.food_pos[0] > game.snake_pos[0],  # Nourriture à droite
+            game.food_pos[1] > game.snake_pos[1],  # Nourriture en haut
+            game.food_pos[1] < game.snake_pos[1],  # Nourriture en bas
         ]
 
-        # Conversion en float et normalisation
+        state = obstacle_distances + [dir_l, dir_r, dir_u, dir_d] + food_direction
+
         return np.array(state, dtype=float)
 
     def remember(self, state, action, reward, next_state, done):
