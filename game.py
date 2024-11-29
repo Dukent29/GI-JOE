@@ -1,5 +1,5 @@
 """
-Snake AI with Persistent Memory and Adaptive Reward System
+Snake AI with Visual Perception Indicators
 Made with Arcade and PyTorch
 """
 
@@ -16,7 +16,7 @@ import time
 import platform
 import ctypes
 import subprocess
-import os  # Ajout de l'import manquant
+import os
 
 # --- Hyperparamètres ---
 difficulty = 0.05  # Temps en secondes entre chaque mise à jour (20 FPS)
@@ -47,8 +47,12 @@ COLOR_FOOD = arcade.color.RED
 COLOR_TEXT = arcade.color.WHITE
 COLOR_REWARD_POSITIVE = arcade.color.GREEN
 COLOR_REWARD_NEGATIVE = arcade.color.RED
-COLOR_BEST_GAME_BORDER = arcade.color.YELLOW  # Changement pour mieux distinguer
-COLOR_WHITE_BORDER = arcade.color.WHITE  # Nouvelle couleur pour les bordures blanches
+COLOR_BEST_GAME_BORDER = arcade.color.YELLOW
+COLOR_WHITE_BORDER = arcade.color.WHITE
+COLOR_RAY_SAFE = arcade.color.BLUE
+COLOR_RAY_DANGER = arcade.color.RED
+COLOR_FOOD_DIRECTION = arcade.color.ORANGE
+COLOR_DANGER_ZONE = arcade.color.RED
 
 # --- Variables Globales pour Empêcher la Mise en Veille ---
 caffeinate_process = None  # Pour macOS
@@ -64,21 +68,17 @@ def prevent_sleep():
         global caffeinate_process
         caffeinate_process = subprocess.Popen(['caffeinate'])
     elif os_name == "Linux":
-        # Sous Linux, la mise en veille dépend de l'environnement de bureau
-        # Vous pouvez ajouter des commandes spécifiques si nécessaire
         pass
 
 def allow_sleep():
     os_name = platform.system()
     if os_name == "Windows":
-        # Réinitialiser l'état pour permettre la mise en veille
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
     elif os_name == "Darwin":  # macOS
         global caffeinate_process
         if caffeinate_process:
             caffeinate_process.terminate()
     elif os_name == "Linux":
-        # Sous Linux, aucune action spécifique
         pass
 
 # --- Classes pour le DQN ---
@@ -136,9 +136,6 @@ class DQNAgent:
                 distance += 1
                 if game.is_collision(pos):
                     break
-                # Optionnel : inclure la nourriture dans la vision
-                # if pos == game.food_pos:
-                #     break
             # Normaliser la distance
             obstacle_distances.append(distance / max_distance)
 
@@ -230,7 +227,7 @@ class DQNAgent:
 class SnakeGameAI:
     def __init__(self, agent, app, x_offset=0, y_offset=0):
         self.agent = agent
-        self.app = app  # Référence à l'application principale pour accéder aux récompenses dynamiques
+        self.app = app  # Référence à l'application principale
         self.x_offset = x_offset
         self.y_offset = y_offset
         self.reward_total = 0
@@ -242,10 +239,10 @@ class SnakeGameAI:
         self.bonbons_manges = 0
         self.intervalles_bonbons = []
         self.temps_last_bonbon = time.time()
-        self.proximite_danger = 0
-        self.deplacements_inutiles = 0
-        self.deplacements_vers_bonbon = 0
-        self.deplacements_eloigne_bonbon = 0
+
+        # Variables pour la perception visuelle
+        self.obstacle_distances = []
+        self.food_direction = []
 
     def reset(self):
         # Aligner la position initiale sur la grille de 10 pixels
@@ -264,16 +261,12 @@ class SnakeGameAI:
         self.last_reward = 0
         self.score = 0
         self.time_limit = 20  # Temps limite par partie, en secondes
-        self.start_time = time.time()  # Utiliser time.time() au lieu de arcade.get_time()
+        self.start_time = time.time()
 
         # Réinitialiser les métriques
         self.bonbons_manges = 0
         self.intervalles_bonbons = []
         self.temps_last_bonbon = time.time()
-        self.proximite_danger = 0
-        self.deplacements_inutiles = 0
-        self.deplacements_vers_bonbon = 0
-        self.deplacements_eloigne_bonbon = 0
 
         # Générer une position de nourriture qui ne chevauche pas le serpent
         while True:
@@ -320,56 +313,21 @@ class SnakeGameAI:
 
     def play_step(self, delta_time, current_generation):
         state_old = self.agent.get_state(self)
+        # Stocker les distances aux obstacles et la direction de la nourriture pour la visualisation
+        self.obstacle_distances = state_old[:8]
+        self.food_direction = state_old[12:]
+
         move = self.agent.act(state_old)
         action = move  # 0: Tout droit, 1: Droite, 2: Gauche
-
-        # Calcul de la distance avant le mouvement
-        distance_old = np.linalg.norm(np.array(self.snake_pos) - np.array(self.food_pos))
 
         self.move(action)
         self.snake_body.insert(0, self.snake_pos[:])
 
-        # Initialisation de la récompense avec la pénalité pour chaque déplacement
-        reward = self.app.rewards['deplacement']
+        # Initialisation de la récompense avec la récompense de survie
+        reward = self.app.rewards['survie']
         done = False
 
-        # Calcul de la distance après le mouvement
-        distance_new = np.linalg.norm(np.array(self.snake_pos) - np.array(self.food_pos))
-
-        # Récompense ou punition basée sur le déplacement
-        delta_distance = distance_old - distance_new
-
-        if delta_distance > 0:
-            # Déplacement vers le bonbon
-            reduction_steps = int((delta_distance / distance_old) * 10) if distance_old != 0 else 0
-            reward += self.app.rewards['deplacement_vers_bonbon'] * reduction_steps
-            self.deplacements_vers_bonbon += 1
-        elif delta_distance < 0:
-            # Déplacement s'éloignant du bonbon
-            increase_steps = int((-delta_distance / distance_old) * 10) if distance_old != 0 else 0
-            reward += self.app.penalties['deplacement_eloigne_bonbon'] * increase_steps
-            self.deplacements_eloigne_bonbon += 1
-        else:
-            # Déplacement inutile
-            self.deplacements_inutiles += 1
-
-        # Vérifier la proximité avec les dangers
-        if self.is_danger_close():
-            reward += self.app.penalties['proximite_danger']
-            self.proximite_danger += 1
-
-        # Gestion du chronomètre
-        elapsed_time = time.time() - self.start_time
-        time_remaining = max(0, self.time_limit - elapsed_time)
-        self.time_remaining = time_remaining  # Stocker le temps restant pour l'affichage
-
-        if time_remaining <= 0:
-            done = True
-            reward += self.app.penalties['temps_expire']
-            self.reward_total += reward
-            self.last_reward = reward  # Stocker la dernière récompense
-            return reward, done, self.score
-
+        # Vérifier les collisions
         if self.is_collision():
             done = True
             reward += self.app.penalties['collision']
@@ -377,22 +335,21 @@ class SnakeGameAI:
             self.last_reward = reward
             return reward, done, self.score
 
+        # Vérifier si le serpent a mangé un bonbon
         if self.snake_pos == self.food_pos:
             self.score += 1
             reward += self.app.rewards['manger_bonbon']
             self.bonbons_manges += 1
-            # Calculer l'intervalle de temps entre les bonbons
+            self.food_spawn = False
             interval = time.time() - self.temps_last_bonbon
             self.intervalles_bonbons.append(interval)
             self.temps_last_bonbon = time.time()
-            self.food_spawn = False
-            # Ne pas supprimer le dernier segment pour que le serpent grandisse
         else:
-            # Toujours supprimer le dernier segment pour maintenir la taille constante
+            # Retirer le dernier segment pour maintenir la taille constante
             self.snake_body.pop()
 
+        # Générer une nouvelle nourriture si nécessaire
         if not self.food_spawn:
-            # Générer une nouvelle nourriture
             while True:
                 new_food_pos = [
                     self.x_offset + random.randrange(0, single_frame_size_x // 10) * 10,
@@ -402,6 +359,18 @@ class SnakeGameAI:
                     self.food_pos = new_food_pos
                     break
             self.food_spawn = True
+
+        # Gestion du chronomètre
+        elapsed_time = time.time() - self.start_time
+        time_remaining = max(0, self.time_limit - elapsed_time)
+        self.time_remaining = time_remaining
+
+        if time_remaining <= 0:
+            done = True
+            reward += self.app.penalties['temps_expire']
+            self.reward_total += reward
+            self.last_reward = reward
+            return reward, done, self.score
 
         self.reward_total += reward
         self.last_reward = reward
@@ -413,23 +382,6 @@ class SnakeGameAI:
         self.agent.remember(state_old, move, reward, state_new, done)
 
         return reward, done, self.score
-
-    def is_danger_close(self):
-        # Vérifie s'il y a un danger à moins de 2 déplacements
-        look_ahead = 2
-        next_pos = self.snake_pos.copy()
-        for _ in range(look_ahead):
-            if self.direction == 'RIGHT':
-                next_pos[0] += 10
-            elif self.direction == 'LEFT':
-                next_pos[0] -= 10
-            elif self.direction == 'UP':
-                next_pos[1] += 10
-            elif self.direction == 'DOWN':
-                next_pos[1] -= 10
-            if self.is_collision(next_pos):
-                return True
-        return False
 
 # --- Classe principale de l'application ---
 class SnakeAIApp(arcade.Window):
@@ -450,24 +402,13 @@ class SnakeAIApp(arcade.Window):
 
         # Définir les récompenses et pénalités initiales
         self.rewards = {
-            'manger_bonbon': 50,
-            'intervalle_bonbon': 25,
-            'deplacement_vers_bonbon': 10,  # Par diminution de 10% de la distance
-            'deplacement': -0.2
+            'manger_bonbon': 40,
+            'survie': 0.1
         }
         self.penalties = {
-            'proximite_danger': -10,
-            'deplacement_eloigne_bonbon': -10,  # Par augmentation de 10% de la distance
-            'collision': -100,
+            'collision': -150,
             'temps_expire': -20
         }
-
-        # Objectifs pour l'ajustement des récompenses
-        self.target_bonbons_per_episode = 5
-        self.target_avg_interval = 2.0  # En secondes
-        self.target_proximite_danger = 5  # Maximum de proximité dangereuse par épisode
-        self.target_deplacements_vers_bonbon = 10
-        self.target_deplacements_eloigne_bonbon = 2
 
         # Charger le modèle, la mémoire, la génération et le meilleur score du meilleur agent précédent
         try:
@@ -570,6 +511,42 @@ class SnakeAIApp(arcade.Window):
                                           game.y_offset + single_frame_size_y - 20,
                                           10, arcade.color.GRAY)
 
+            # Dessiner les rayons de détection
+            head_x, head_y = game.snake_pos
+            directions = [
+                (0, 10),    # Haut
+                (10, 10),   # Haut-Droite
+                (10, 0),    # Droite
+                (10, -10),  # Bas-Droite
+                (0, -10),   # Bas
+                (-10, -10), # Bas-Gauche
+                (-10, 0),   # Gauche
+                (-10, 10)   # Haut-Gauche
+            ]
+
+            for idx, (dx, dy) in enumerate(directions):
+                distance = game.obstacle_distances[idx] * (max(single_frame_size_x, single_frame_size_y))
+                end_x = head_x + dx * distance
+                end_y = head_y + dy * distance
+                color = COLOR_RAY_SAFE if distance > 50 else COLOR_RAY_DANGER
+                arcade.draw_line(head_x + 5, head_y + 5, end_x + 5, end_y + 5, color, 1)
+
+            # Indiquer la direction de la nourriture
+            food_dir = game.food_direction
+            arrow_size = 20
+            if food_dir[0]:  # Nourriture à gauche
+                arcade.draw_line(head_x + 5, head_y + 5, head_x - arrow_size + 5, head_y + 5, COLOR_FOOD_DIRECTION, 2)
+            if food_dir[1]:  # Nourriture à droite
+                arcade.draw_line(head_x + 5, head_y + 5, head_x + arrow_size + 5, head_y + 5, COLOR_FOOD_DIRECTION, 2)
+            if food_dir[2]:  # Nourriture en haut
+                arcade.draw_line(head_x + 5, head_y + 5, head_x + 5, head_y + arrow_size + 5, COLOR_FOOD_DIRECTION, 2)
+            if food_dir[3]:  # Nourriture en bas
+                arcade.draw_line(head_x + 5, head_y + 5, head_x + 5, head_y - arrow_size + 5, COLOR_FOOD_DIRECTION, 2)
+
+            # Indiquer si le danger est proche
+            if min(game.obstacle_distances) < 0.1:
+                arcade.draw_circle_outline(head_x + 5, head_y + 5, 20, COLOR_DANGER_ZONE, 2)
+
         # Afficher la génération en haut au centre de la fenêtre
         arcade.draw_text(f"Génération: {self.generation}",
                          self.width // 2, self.height - 30,
@@ -620,46 +597,6 @@ class SnakeAIApp(arcade.Window):
             writer.add_scalar('Reward/max', max_reward, self.generation)
             writer.add_scalar('Score/max', max_score, self.generation)
 
-            # Sauvegarder des statistiques détaillées dans TensorBoard
-            total_bonbons = sum(game.bonbons_manges for game in self.games)
-            avg_bonbons = total_bonbons / len(self.games)
-            avg_interval = np.mean([np.mean(game.intervalles_bonbons) if game.intervalles_bonbons else self.target_avg_interval
-                                    for game in self.games])
-            total_proximite_danger = sum(game.proximite_danger for game in self.games)
-            avg_proximite_danger = total_proximite_danger / len(self.games)
-            total_deplacements_vers = sum(game.deplacements_vers_bonbon for game in self.games)
-            total_deplacements_eloigne = sum(game.deplacements_eloigne_bonbon for game in self.games)
-
-            writer.add_scalar('Stats/Total_bonbons', total_bonbons, self.generation)
-            writer.add_scalar('Stats/Average_bonbons', avg_bonbons, self.generation)
-            writer.add_scalar('Stats/Average_interval_between_bonbons', avg_interval, self.generation)
-            writer.add_scalar('Stats/Total_proximity_danger', total_proximite_danger, self.generation)
-            writer.add_scalar('Stats/Average_proximity_danger', avg_proximite_danger, self.generation)
-            writer.add_scalar('Stats/Total_deplacements_vers_bonbon', total_deplacements_vers, self.generation)
-            writer.add_scalar('Stats/Total_deplacements_eloigne_bonbon', total_deplacements_eloigne, self.generation)
-            writer.add_scalar('Stats/Deplacements_inutiles', sum(game.deplacements_inutiles for game in self.games), self.generation)
-
-            # Ajouter les dynamiques des récompenses et pénalités
-            writer.add_scalar('Rewards/manger_bonbon', self.rewards['manger_bonbon'], self.generation)
-            writer.add_scalar('Rewards/intervalle_bonbon', self.rewards['intervalle_bonbon'], self.generation)
-            writer.add_scalar('Rewards/deplacement_vers_bonbon', self.rewards['deplacement_vers_bonbon'], self.generation)
-            writer.add_scalar('Rewards/deplacement', self.rewards['deplacement'], self.generation)
-            writer.add_scalar('Penalties/proximite_danger', self.penalties['proximite_danger'], self.generation)
-            writer.add_scalar('Penalties/deplacement_eloigne_bonbon', self.penalties['deplacement_eloigne_bonbon'], self.generation)
-            writer.add_scalar('Penalties/collision', self.penalties['collision'], self.generation)
-            writer.add_scalar('Penalties/temps_expire', self.penalties['temps_expire'], self.generation)
-
-            # Enregistrer les métriques dans TensorBoard
-            writer.add_scalar('Generation/Average_bonbons', avg_bonbons, self.generation)
-            writer.add_scalar('Generation/Average_interval', avg_interval, self.generation)
-            writer.add_scalar('Generation/Average_proximity_danger', avg_proximite_danger, self.generation)
-            writer.add_scalar('Generation/Total_deplacements_vers_bonbon', total_deplacements_vers, self.generation)
-            writer.add_scalar('Generation/Total_deplacements_eloigne_bonbon', total_deplacements_eloigne, self.generation)
-            writer.add_scalar('Generation/Deplacements_inutiles', sum(game.deplacements_inutiles for game in self.games), self.generation)
-
-            # Ajuster les récompenses et pénalités automatiquement
-            self.adjust_rewards()
-
             # Mettre à jour les paramètres de l'agent
             best_model_state_dict = self.agent.model.state_dict()
             best_memory = self.agent.memory
@@ -690,68 +627,6 @@ class SnakeAIApp(arcade.Window):
             self.done_flags = [False] * len(self.games)
             for game in self.games:
                 game.reset()
-
-    def adjust_rewards(self):
-        """
-        Ajuste automatiquement les récompenses et pénalités en fonction des performances de l'agent.
-        """
-        total_bonbons = sum(game.bonbons_manges for game in self.games)
-        avg_bonbons = total_bonbons / len(self.games)
-        avg_interval = np.mean([np.mean(game.intervalles_bonbons) if game.intervalles_bonbons else self.target_avg_interval
-                                for game in self.games])
-        total_proximite_danger = sum(game.proximite_danger for game in self.games)
-        avg_proximite_danger = total_proximite_danger / len(self.games)
-        total_deplacements_vers = sum(game.deplacements_vers_bonbon for game in self.games)
-        total_deplacements_eloigne = sum(game.deplacements_eloigne_bonbon for game in self.games)
-
-        print(f"Ajustement des récompenses et pénalités pour la génération {self.generation}")
-        print(f"Bonbons moyens par jeu: {avg_bonbons}")
-        print(f"Intervalle moyen entre bonbons: {avg_interval}")
-        print(f"Proximité danger moyenne: {avg_proximite_danger}")
-        print(f"Total de déplacements vers bonbon: {total_deplacements_vers}")
-        print(f"Total de déplacements éloignés du bonbon: {total_deplacements_eloigne}")
-
-        # Ajuster la récompense pour manger un bonbon
-        if avg_bonbons < self.target_bonbons_per_episode:
-            self.rewards['manger_bonbon'] = min(self.rewards['manger_bonbon'] + 5, 100)
-            print("Augmentation de la récompense pour manger un bonbon")
-        elif avg_bonbons > self.target_bonbons_per_episode:
-            self.rewards['manger_bonbon'] = max(self.rewards['manger_bonbon'] - 5, 20)
-            print("Diminution de la récompense pour manger un bonbon")
-
-        # Ajuster la récompense pour réduire l'intervalle entre les bonbons
-        if avg_interval > self.target_avg_interval:
-            self.rewards['intervalle_bonbon'] = min(self.rewards['intervalle_bonbon'] + 5, 50)
-            print("Augmentation de la récompense pour réduire l'intervalle entre bonbons")
-        elif avg_interval < self.target_avg_interval:
-            self.rewards['intervalle_bonbon'] = max(self.rewards['intervalle_bonbon'] - 5, 10)
-            print("Diminution de la récompense pour réduire l'intervalle entre bonbons")
-
-        # Ajuster la pénalité pour proximité dangereuse
-        if avg_proximite_danger > self.target_proximite_danger:
-            self.penalties['proximite_danger'] = max(self.penalties['proximite_danger'] - 2, -50)
-            print("Augmentation de la pénalité pour proximité dangereuse")
-        elif avg_proximite_danger < self.target_proximite_danger:
-            self.penalties['proximite_danger'] = min(self.penalties['proximite_danger'] + 2, -5)
-            print("Diminution de la pénalité pour proximité dangereuse")
-
-        # Ajuster la récompense pour les déplacements vers le bonbon
-        expected_deplacements_vers = self.target_deplacements_vers_bonbon * len(self.games)
-        if total_deplacements_vers < expected_deplacements_vers:
-            self.rewards['deplacement_vers_bonbon'] = min(self.rewards['deplacement_vers_bonbon'] + 2, 20)
-            print("Augmentation de la récompense pour les déplacements vers le bonbon")
-        elif total_deplacements_vers > expected_deplacements_vers:
-            self.rewards['deplacement_vers_bonbon'] = max(self.rewards['deplacement_vers_bonbon'] - 2, 5)
-            print("Diminution de la récompense pour les déplacements vers le bonbon")
-
-        # Ajuster la pénalité pour les déplacements s'éloignant du bonbon
-        expected_deplacements_eloigne = self.target_deplacements_eloigne_bonbon * len(self.games)
-        if total_deplacements_eloigne > expected_deplacements_eloigne:
-            self.penalties['deplacement_eloigne_bonbon'] = max(self.penalties['deplacement_eloigne_bonbon'] - 2, -50)
-            print("Augmentation de la pénalité pour les déplacements éloignés du bonbon")
-        elif total_deplacements_eloigne < expected_deplacements_eloigne:
-            self.penalties['deplacement_eloigne_bonbon'] = min(self.penalties['deplacement_eloigne_bonbon'] + 2, -5)
-            print("Diminution de la pénalité pour les déplacements éloignés du bonbon")
 
     def on_close(self):
         print("Fermeture du jeu, sauvegarde en cours...")
