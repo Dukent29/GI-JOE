@@ -674,6 +674,23 @@ class SnakeAIApp(arcade.Window):
         self.success_rates = []
         self.consistency_count = 0
 
+        # --- Nouvelle Variable pour le Speed Up ---
+        self.speed_multiplier = 1  # 1x par défaut
+
+        # --- Mapping des touches numériques à leurs multiplicateurs ---
+        self.speed_key_mapping = {
+            arcade.key.KEY_0: 0,
+            arcade.key.KEY_1: 1,
+            arcade.key.KEY_2: 2,
+            arcade.key.KEY_3: 3,
+            arcade.key.KEY_4: 4,
+            arcade.key.KEY_5: 5,
+            arcade.key.KEY_6: 6,
+            arcade.key.KEY_7: 7,
+            arcade.key.KEY_8: 8,
+            arcade.key.KEY_9: 9,
+        }
+
     def on_draw(self):
         arcade.start_render()
         # Dessiner tous les jeux
@@ -830,6 +847,12 @@ class SnakeAIApp(arcade.Window):
                          self.width // 2, self.height - 90,
                          COLOR_TEXT, 16, anchor_x="center")
 
+        # --- Afficher la Vitesse Actuelle ---
+        speed_display = "Pause" if self.speed_multiplier == 0 else f"Vitesse: {self.speed_multiplier}x"
+        arcade.draw_text(speed_display,
+                         10, 10,
+                         arcade.color.WHITE, 14)
+
     def clip_line_to_frame(self, x1, y1, x2, y2, x_offset, y_offset):
         # Limiter la ligne aux limites du cadre du jeu
         min_x = x_offset
@@ -941,132 +964,149 @@ class SnakeAIApp(arcade.Window):
             writer.add_scalar('Penalties/temps_expire', self.penalties['temps_expire'], self.generation)
 
     def on_update(self, delta_time):
-        # Jouer les parties
-        if not all(self.done_flags):
-            for i, game in enumerate(self.games):
-                if not self.done_flags[i]:
-                    reward, done, score = game.play_step(delta_time, current_generation=self.generation)
-                    self.done_flags[i] = done
-        else:
-            # Entraîner l'agent une fois après avoir joué toutes les parties
-            self.agent.replay()
-
-            # Mettre à jour le réseau cible périodiquement
-            if self.generation % target_update == 0:
-                print("Updating target network...")
-                self.agent.update_target_model()
-
-            # Collecter les récompenses totales et les scores de chaque jeu
-            rewards = [game.reward_total for game in self.games]
-            scores = [game.score for game in self.games]
-            avg_reward = sum(rewards) / len(rewards)
-            max_reward = max(rewards)
-            max_score = max(scores)
-            print(f"Récompenses des jeux: {rewards}")
-            print(f"Scores des jeux: {scores}")
-            print(f"Récompense moyenne: {avg_reward}")
-            print(f"Récompense maximale: {max_reward}")
-            print(f"Meilleur score de la génération: {max_score}")
-
-            # Enregistrer les métriques
-            self.scores_history.append(avg_reward)
-            self.rewards_history.append(avg_reward)
-            self.loss_history.append(self.agent.current_loss)
-            success_rate = sum([1 for s in scores if s >= success_score]) / len(scores)
-            self.success_rates.append(success_rate)
-
-            # Limiter la taille des historiques
-            if len(self.scores_history) > window_size:
-                self.scores_history.pop(0)
-                self.rewards_history.pop(0)
-                self.loss_history.pop(0)
-                self.success_rates.pop(0)
-
-            # Ajuster les récompenses et pénalités en fonction des performances
-            self.adjust_rewards_penalties()
-
-            # Vérifier les critères pour le passage au LSTM
-            if not self.agent.use_lstm:
-                criteria_met = False
-                if len(self.scores_history) == window_size:
-                    avg_score = sum(self.scores_history) / window_size
-                    avg_reward_window = sum(self.rewards_history) / window_size
-                    avg_loss = sum(self.loss_history) / window_size
-                    avg_success_rate = sum(self.success_rates) / window_size
-
-                    criteria_met = (
-                            avg_score >= score_threshold and
-                            avg_reward_window >= reward_threshold and
-                            avg_loss <= loss_threshold and
-                            avg_success_rate >= success_rate_threshold
-                    )
-
-                    if criteria_met:
-                        self.consistency_count += 1
-                    else:
-                        self.consistency_count = 0
-
-                    print(f"Critères satisfaits : {criteria_met}, Compteur de consistance : {self.consistency_count}")
-
-                    if self.consistency_count >= consistency_threshold:
-                        print("Passage au modèle LSTM.")
-                        self.agent.use_lstm = True
-                        self.agent.model = self.agent.build_lstm_model().to(self.device)
-                        self.agent.target_model = self.agent.build_lstm_model().to(self.device)
-                        # Transférer les poids si possible
-                        # Ici, nous pouvons initialiser les poids du LSTM avec ceux du modèle simple (selon la compatibilité)
-                        self.agent.optimizer = optim.Adam(self.agent.model.parameters(), lr=learning_rate)
-                        self.consistency_count = 0  # Réinitialiser le compteur
+        # Jouer les parties en fonction du speed_multiplier
+        if self.speed_multiplier > 0:
+            for _ in range(self.speed_multiplier):
+                if not all(self.done_flags):
+                    for i, game in enumerate(self.games):
+                        if not self.done_flags[i]:
+                            reward, done, score = game.play_step(delta_time, current_generation=self.generation)
+                            self.done_flags[i] = done
                 else:
-                    self.consistency_count = 0
+                    # Entraîner l'agent une fois après avoir joué toutes les parties
+                    self.agent.replay()
 
-            # Mettre à jour le meilleur score global si nécessaire
-            if max_score > self.best_score:
-                self.best_score = max_score
+                    # Mettre à jour le réseau cible périodiquement
+                    if self.generation % target_update == 0:
+                        print("Updating target network...")
+                        self.agent.update_target_model()
 
-            # Identifier l'index du meilleur jeu
-            self.best_game_index = scores.index(max_score)
+                    # Collecter les récompenses totales et les scores de chaque jeu
+                    rewards = [game.reward_total for game in self.games]
+                    scores = [game.score for game in self.games]
+                    avg_reward = sum(rewards) / len(rewards)
+                    max_reward = max(rewards)
+                    max_score = max(scores)
+                    print(f"Récompenses des jeux: {rewards}")
+                    print(f"Scores des jeux: {scores}")
+                    print(f"Récompense moyenne: {avg_reward}")
+                    print(f"Récompense maximale: {max_reward}")
+                    print(f"Meilleur score de la génération: {max_score}")
 
-            # Sauvegarder les récompenses moyennes et maximales dans TensorBoard
-            writer.add_scalar('Reward/avg', avg_reward, self.generation)
-            writer.add_scalar('Reward/max', max_reward, self.generation)
-            writer.add_scalar('Score/max', max_score, self.generation)
-            writer.add_scalar('Epsilon', self.agent.epsilon, self.generation)
-            writer.add_scalar('Loss', self.agent.current_loss, self.generation)
-            writer.add_scalar('Success Rate', success_rate, self.generation)
+                    # Enregistrer les métriques
+                    self.scores_history.append(avg_reward)
+                    self.rewards_history.append(avg_reward)
+                    self.loss_history.append(self.agent.current_loss)
+                    success_rate = sum([1 for s in scores if s >= success_score]) / len(scores)
+                    self.success_rates.append(success_rate)
 
-            # Sauvegarder le modèle si le meilleur score est atteint
-            if max_score >= self.best_score:
-                best_model_state_dict = self.agent.model.state_dict()
-                best_memory = self.agent.memory
-                best_epsilon = self.agent.epsilon
-                with open("best_agent.pkl", "wb") as f:
-                    pickle.dump({
-                        'model_state_dict': best_model_state_dict,
-                        'memory': best_memory,
-                        'epsilon': best_epsilon,
-                        'generation': self.generation,
-                        'best_score': self.best_score,
-                        'use_lstm': self.agent.use_lstm
-                    }, f)
-                print("Meilleur agent sauvegardé dans best_agent.pkl")
+                    # Limiter la taille des historiques
+                    if len(self.scores_history) > window_size:
+                        self.scores_history.pop(0)
+                        self.rewards_history.pop(0)
+                        self.loss_history.pop(0)
+                        self.success_rates.pop(0)
 
-            # Sauvegarder les statistiques détaillées
-            writer.add_scalar('Stats/Generation', self.generation, self.generation)
-            writer.add_scalar('Stats/Best_score', self.best_score, self.generation)
+                    # Ajuster les récompenses et pénalités en fonction des performances
+                    self.adjust_rewards_penalties()
 
-            # Sauvegarder le meilleur score dans un fichier séparé pour une récupération rapide
-            with open("best_score.txt", "w") as f:
-                f.write(str(self.best_score))
+                    # Vérifier les critères pour le passage au LSTM
+                    if not self.agent.use_lstm:
+                        criteria_met = False
+                        if len(self.scores_history) == window_size:
+                            avg_score = sum(self.scores_history) / window_size
+                            avg_reward_window = sum(self.rewards_history) / window_size
+                            avg_loss = sum(self.loss_history) / window_size
+                            avg_success_rate = sum(self.success_rates) / window_size
 
-            # Mettre à jour l'epsilon
-            self.agent.epsilon = max(min_epsilon, self.agent.epsilon * epsilon_decay)
+                            criteria_met = (
+                                    avg_score >= score_threshold and
+                                    avg_reward_window >= reward_threshold and
+                                    avg_loss <= loss_threshold and
+                                    avg_success_rate >= success_rate_threshold
+                            )
 
-            # Préparer la prochaine génération
-            self.generation += 1
-            self.done_flags = [False] * len(self.games)
-            for game in self.games:
-                game.reset()
+                            if criteria_met:
+                                self.consistency_count += 1
+                            else:
+                                self.consistency_count = 0
+
+                            print(f"Critères satisfaits : {criteria_met}, Compteur de consistance : {self.consistency_count}")
+
+                            if self.consistency_count >= consistency_threshold:
+                                print("Passage au modèle LSTM.")
+                                self.agent.use_lstm = True
+                                self.agent.model = self.agent.build_lstm_model().to(self.device)
+                                self.agent.target_model = self.agent.build_lstm_model().to(self.device)
+                                # Transférer les poids si possible
+                                # Ici, nous pouvons initialiser les poids du LSTM avec ceux du modèle simple (selon la compatibilité)
+                                self.agent.optimizer = optim.Adam(self.agent.model.parameters(), lr=learning_rate)
+                                self.consistency_count = 0  # Réinitialiser le compteur
+                        else:
+                            self.consistency_count = 0
+
+                    # Mettre à jour le meilleur score global si nécessaire
+                    if max_score > self.best_score:
+                        self.best_score = max_score
+
+                    # Identifier l'index du meilleur jeu
+                    self.best_game_index = scores.index(max_score)
+
+                    # Sauvegarder les récompenses moyennes et maximales dans TensorBoard
+                    writer.add_scalar('Reward/avg', avg_reward, self.generation)
+                    writer.add_scalar('Reward/max', max_reward, self.generation)
+                    writer.add_scalar('Score/max', max_score, self.generation)
+                    writer.add_scalar('Epsilon', self.agent.epsilon, self.generation)
+                    writer.add_scalar('Loss', self.agent.current_loss, self.generation)
+                    writer.add_scalar('Success Rate', success_rate, self.generation)
+
+                    # Sauvegarder le modèle si le meilleur score est atteint
+                    if max_score >= self.best_score:
+                        best_model_state_dict = self.agent.model.state_dict()
+                        best_memory = self.agent.memory
+                        best_epsilon = self.agent.epsilon
+                        with open("best_agent.pkl", "wb") as f:
+                            pickle.dump({
+                                'model_state_dict': best_model_state_dict,
+                                'memory': best_memory,
+                                'epsilon': best_epsilon,
+                                'generation': self.generation,
+                                'best_score': self.best_score,
+                                'use_lstm': self.agent.use_lstm
+                            }, f)
+                        print("Meilleur agent sauvegardé dans best_agent.pkl")
+
+                    # Sauvegarder les statistiques détaillées
+                    writer.add_scalar('Stats/Generation', self.generation, self.generation)
+                    writer.add_scalar('Stats/Best_score', self.best_score, self.generation)
+
+                    # Sauvegarder le meilleur score dans un fichier séparé pour une récupération rapide
+                    with open("best_score.txt", "w") as f:
+                        f.write(str(self.best_score))
+
+                    # Mettre à jour l'epsilon
+                    self.agent.epsilon = max(min_epsilon, self.agent.epsilon * epsilon_decay)
+
+                    # Préparer la prochaine génération
+                    self.generation += 1
+                    self.done_flags = [False] * len(self.games)
+                    for game in self.games:
+                        game.reset()
+
+    def on_key_press(self, key, modifiers):
+        """
+        Gère les pressions sur les touches pour ajuster la vitesse du jeu.
+        Les touches numériques de 0 à 9 ajustent le multiplicateur de vitesse.
+        0 met le jeu en pause.
+        """
+        if key in self.speed_key_mapping:
+            # Récupérer le multiplicateur basé sur la touche pressée
+            multiplier = self.speed_key_mapping[key]
+            if multiplier == 0:
+                self.speed_multiplier = 0  # Pause
+            else:
+                self.speed_multiplier = multiplier  # 1x à 9x
+            print(f"Vitesse ajustée à {self.speed_multiplier}x")
 
     def on_close(self):
         print("Fermeture du jeu, sauvegarde en cours...")
