@@ -1,6 +1,6 @@
 """
-Snake AI with Visual Perception Indicators
-Made with Arcade and PyTorch
+Snake AI avec DQN et LSTM
+Créé avec Arcade et PyTorch
 """
 
 import arcade
@@ -28,6 +28,7 @@ epsilon_decay = 0.995
 min_epsilon = 0.01
 learning_rate = 0.001
 target_update = 10
+sequence_length = 4  # Longueur des séquences pour le LSTM
 
 # --- Dimensions de la fenêtre ---
 rows = 2
@@ -53,6 +54,7 @@ COLOR_RAY_SAFE = arcade.color.BLUE
 COLOR_RAY_DANGER = arcade.color.RED
 COLOR_FOOD_DIRECTION = arcade.color.ORANGE
 COLOR_DANGER_ZONE = arcade.color.RED
+COLOR_Q_VALUES = [arcade.color.GREEN, arcade.color.YELLOW, arcade.color.RED]  # Pour les valeurs Q
 
 # --- Variables Globales pour Empêcher la Mise en Veille ---
 caffeinate_process = None  # Pour macOS
@@ -81,7 +83,7 @@ def allow_sleep():
     elif os_name == "Linux":
         pass
 
-# --- Classes pour le DQN ---
+# --- Classes pour le DQN avec LSTM ---
 class DQNAgent:
     def __init__(self, model=None, memory=None, epsilon=epsilon_start, device='cpu'):
         self.memory = deque(maxlen=max_memory_size) if memory is None else memory
@@ -94,16 +96,30 @@ class DQNAgent:
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
         self.criterion = nn.MSELoss()
         self.step_count = 0  # Compteur pour TensorBoard
+        self.hidden_state = None  # État caché initial du LSTM
+        self.q_values = None  # Initialiser q_values à None
 
     def build_model(self):
-        # La taille de l'état est maintenant de 16
-        model = nn.Sequential(
-            nn.Linear(16, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 3)
-        )
+        class LSTMNet(nn.Module):
+            def __init__(self, input_size, hidden_size, output_size):
+                super(LSTMNet, self).__init__()
+                self.fc1 = nn.Linear(input_size, hidden_size)
+                self.relu = nn.ReLU()
+                self.lstm = nn.LSTM(hidden_size, hidden_size, batch_first=True)
+                self.fc2 = nn.Linear(hidden_size, output_size)
+
+            def forward(self, x, hidden_state):
+                x = self.fc1(x)
+                x = self.relu(x)
+                x, hidden_state = self.lstm(x, hidden_state)
+                x = self.fc2(x)
+                return x, hidden_state
+
+        input_size = 16  # Taille de l'état
+        hidden_size = 128
+        output_size = 3  # Nombre d'actions possibles
+
+        model = LSTMNet(input_size, hidden_size, output_size)
         return model
 
     def update_target_model(self):
@@ -134,7 +150,7 @@ class DQNAgent:
                 pos[0] += dx
                 pos[1] += dy
                 distance += 1
-                if game.is_collision(pos):
+                if game.is_collision(pos) or not self.is_within_frame(pos, game.x_offset, game.y_offset):
                     break
             # Normaliser la distance
             obstacle_distances.append(distance / max_distance)
@@ -157,40 +173,76 @@ class DQNAgent:
 
         return np.array(state, dtype=float)
 
+    def is_within_frame(self, pos, x_offset, y_offset):
+        return x_offset <= pos[0] < x_offset + single_frame_size_x and y_offset <= pos[1] < y_offset + single_frame_size_y
+
     def remember(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
+        # Stocker une séquence d'états pour le LSTM
+        if hasattr(self, 'state_sequence'):
+            self.state_sequence.append(state)
+            self.action_sequence.append(action)
+            self.reward_sequence.append(reward)
+            self.next_state_sequence.append(next_state)
+            self.done_sequence.append(done)
+            if len(self.state_sequence) == sequence_length:
+                self.memory.append((
+                    list(self.state_sequence),
+                    list(self.action_sequence),
+                    list(self.reward_sequence),
+                    list(self.next_state_sequence),
+                    list(self.done_sequence)
+                ))
+                self.state_sequence.pop(0)
+                self.action_sequence.pop(0)
+                self.reward_sequence.pop(0)
+                self.next_state_sequence.pop(0)
+                self.done_sequence.pop(0)
+        else:
+            self.state_sequence = [state]
+            self.action_sequence = [action]
+            self.reward_sequence = [reward]
+            self.next_state_sequence = [next_state]
+            self.done_sequence = [done]
 
     def act(self, state):
+        state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0).unsqueeze(0).to(self.device)
         if random.uniform(0, 1) < self.epsilon:
-            return random.randint(0, 2)
-        state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
-        prediction = self.model(state0)
-        return torch.argmax(prediction).item()
+            # Action aléatoire (exploration)
+            self.hidden_state = None  # Réinitialiser l'état caché pour l'action aléatoire
+            with torch.no_grad():
+                prediction, _ = self.model(state0, self.hidden_state)
+            action = random.randint(0, 2)
+        else:
+            # Action basée sur le modèle (exploitation)
+            with torch.no_grad():
+                prediction, self.hidden_state = self.model(state0, self.hidden_state)
+            action = torch.argmax(prediction).item()
+        self.q_values = prediction.cpu().numpy()[0]
+        return action
 
     def replay(self):
         if len(self.memory) < batch_size:
             return
         minibatch = random.sample(self.memory, batch_size)
-        states, actions, rewards, next_states, dones = zip(*minibatch)
+        states_seq, actions_seq, rewards_seq, next_states_seq, dones_seq = zip(*minibatch)
 
-        states = torch.tensor(np.array(states), dtype=torch.float).to(self.device)
-        actions = torch.tensor(actions, dtype=torch.long).unsqueeze(1).to(self.device)
-        rewards = torch.tensor(rewards, dtype=torch.float).unsqueeze(1).to(self.device)
-        next_states = torch.tensor(np.array(next_states), dtype=torch.float).to(self.device)
-        dones = torch.tensor(dones, dtype=torch.bool).unsqueeze(1).to(self.device)
+        # Convertir en tenseurs
+        states_seq = torch.tensor(states_seq, dtype=torch.float).to(self.device)
+        actions_seq = torch.tensor(actions_seq, dtype=torch.long).to(self.device)
+        rewards_seq = torch.tensor(rewards_seq, dtype=torch.float).to(self.device)
+        next_states_seq = torch.tensor(next_states_seq, dtype=torch.float).to(self.device)
+        dones_seq = torch.tensor(dones_seq, dtype=torch.float).to(self.device)
 
-        # Prédictions actuelles
-        pred = self.model(states).gather(1, actions)
+        h0 = None  # Initialiser l'état caché
 
-        # Calcul des cibles avec Double DQN
-        with torch.no_grad():
-            best_actions = self.model(next_states).argmax(1).unsqueeze(1)
-            Q_new = self.target_model(next_states).gather(1, best_actions)
-            Q_new[dones] = 0.0
-            target = rewards + gamma * Q_new
+        pred, _ = self.model(states_seq, h0)
+        target_pred, _ = self.target_model(next_states_seq, h0)
 
-        # Calcul de la perte et optimisation
-        loss = self.criterion(pred, target)
+        pred = pred.gather(2, actions_seq.unsqueeze(2)).squeeze(2)
+
+        target = rewards_seq + (1 - dones_seq) * gamma * torch.max(target_pred, dim=2)[0]
+
+        loss = self.criterion(pred, target.detach())
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -201,19 +253,24 @@ class DQNAgent:
         self.step_count += 1
 
     def train_short_memory(self, state, action, reward, next_state, done):
-        state0 = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
-        next_state0 = torch.tensor(next_state, dtype=torch.float).unsqueeze(0).to(self.device)
-        target = self.model(state0).clone()
+        # Pour l'entraînement à court terme, nous utilisons des séquences de longueur 1
+        state_seq = torch.tensor([state], dtype=torch.float).unsqueeze(0).to(self.device)
+        action_seq = torch.tensor([[action]], dtype=torch.long).to(self.device)
+        reward_seq = torch.tensor([[reward]], dtype=torch.float).to(self.device)
+        next_state_seq = torch.tensor([next_state], dtype=torch.float).unsqueeze(0).to(self.device)
+        done_seq = torch.tensor([[done]], dtype=torch.float).to(self.device)
 
-        with torch.no_grad():
-            if not done:
-                Q_new = reward + gamma * self.target_model(next_state0).max(1)[0].unsqueeze(1)
-            else:
-                Q_new = torch.tensor([[reward]], device=self.device)
-        target[0][action] = Q_new
+        h0 = None  # État caché initial pour l'entraînement
 
-        # Calcul de la perte et optimisation
-        loss = self.criterion(self.model(state0), target)
+        pred, _ = self.model(state_seq, h0)
+        target_pred, _ = self.target_model(next_state_seq, h0)
+
+        pred = pred.gather(2, action_seq.unsqueeze(2)).squeeze(2)
+
+        target = reward_seq + (1 - done_seq) * gamma * torch.max(target_pred, dim=2)[0]
+        target.detach_()
+
+        loss = self.criterion(pred, target)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -243,6 +300,8 @@ class SnakeGameAI:
         # Variables pour la perception visuelle
         self.obstacle_distances = []
         self.food_direction = []
+        self.q_values = [0, 0, 0]
+        self.next_action = 0
 
     def reset(self):
         # Aligner la position initiale sur la grille de 10 pixels
@@ -262,6 +321,7 @@ class SnakeGameAI:
         self.score = 0
         self.time_limit = 20  # Temps limite par partie, en secondes
         self.start_time = time.time()
+        self.time_remaining = self.time_limit  # Initialiser le temps restant
 
         # Réinitialiser les métriques
         self.bonbons_manges = 0
@@ -311,6 +371,13 @@ class SnakeGameAI:
         elif self.direction == 'DOWN':
             self.snake_pos[1] -= 10
 
+        # Mettre à jour le temps restant après le déplacement
+        self.update_time()
+
+    def update_time(self):
+        elapsed_time = time.time() - self.start_time
+        self.time_remaining = max(0, self.time_limit - elapsed_time)
+
     def play_step(self, delta_time, current_generation):
         state_old = self.agent.get_state(self)
         # Stocker les distances aux obstacles et la direction de la nourriture pour la visualisation
@@ -318,6 +385,9 @@ class SnakeGameAI:
         self.food_direction = state_old[12:]
 
         move = self.agent.act(state_old)
+        self.next_action = move  # Stocker l'action pour la visualisation
+        self.q_values = self.agent.q_values  # Récupérer les valeurs Q pour la visualisation
+
         action = move  # 0: Tout droit, 1: Droite, 2: Gauche
 
         self.move(action)
@@ -360,12 +430,8 @@ class SnakeGameAI:
                     break
             self.food_spawn = True
 
-        # Gestion du chronomètre
-        elapsed_time = time.time() - self.start_time
-        time_remaining = max(0, self.time_limit - elapsed_time)
-        self.time_remaining = time_remaining
-
-        if time_remaining <= 0:
+        # Vérifier si le temps est écoulé
+        if self.time_remaining <= 0:
             done = True
             reward += self.app.penalties['temps_expire']
             self.reward_total += reward
@@ -528,24 +594,69 @@ class SnakeAIApp(arcade.Window):
                 distance = game.obstacle_distances[idx] * (max(single_frame_size_x, single_frame_size_y))
                 end_x = head_x + dx * distance
                 end_y = head_y + dy * distance
+
+                # Limiter les rayons aux limites du cadre du jeu
+                end_x, end_y = self.clip_line_to_frame(head_x, head_y, end_x, end_y, game.x_offset, game.y_offset)
+
                 color = COLOR_RAY_SAFE if distance > 50 else COLOR_RAY_DANGER
                 arcade.draw_line(head_x + 5, head_y + 5, end_x + 5, end_y + 5, color, 1)
 
-            # Indiquer la direction de la nourriture
+            # Indiquer la direction de la nourriture avec des flèches
             food_dir = game.food_direction
-            arrow_size = 20
+            arrow_size = 15
+            arrow_head_size = 5
             if food_dir[0]:  # Nourriture à gauche
-                arcade.draw_line(head_x + 5, head_y + 5, head_x - arrow_size + 5, head_y + 5, COLOR_FOOD_DIRECTION, 2)
+                self.draw_arrow(head_x + 5, head_y + 5, head_x - arrow_size + 5, head_y + 5, COLOR_FOOD_DIRECTION)
             if food_dir[1]:  # Nourriture à droite
-                arcade.draw_line(head_x + 5, head_y + 5, head_x + arrow_size + 5, head_y + 5, COLOR_FOOD_DIRECTION, 2)
+                self.draw_arrow(head_x + 5, head_y + 5, head_x + arrow_size + 5, head_y + 5, COLOR_FOOD_DIRECTION)
             if food_dir[2]:  # Nourriture en haut
-                arcade.draw_line(head_x + 5, head_y + 5, head_x + 5, head_y + arrow_size + 5, COLOR_FOOD_DIRECTION, 2)
+                self.draw_arrow(head_x + 5, head_y + 5, head_x + 5, head_y + arrow_size + 5, COLOR_FOOD_DIRECTION)
             if food_dir[3]:  # Nourriture en bas
-                arcade.draw_line(head_x + 5, head_y + 5, head_x + 5, head_y - arrow_size + 5, COLOR_FOOD_DIRECTION, 2)
+                self.draw_arrow(head_x + 5, head_y + 5, head_x + 5, head_y - arrow_size + 5, COLOR_FOOD_DIRECTION)
 
             # Indiquer si le danger est proche
             if min(game.obstacle_distances) < 0.1:
                 arcade.draw_circle_outline(head_x + 5, head_y + 5, 20, COLOR_DANGER_ZONE, 2)
+
+            # Afficher les valeurs Q pour chaque action
+            q_values = game.q_values
+            if q_values is not None and len(q_values) > 0:
+                q_values = np.array(q_values).flatten()
+                max_q = np.max(np.abs(q_values))
+            else:
+                max_q = 1  # Éviter la division par zéro
+
+            bar_width = 50
+            bar_height = 10
+            actions = ['Tout droit', 'Droite', 'Gauche']
+            for idx, q in enumerate(q_values):
+                if max_q != 0:
+                    bar_length = (q / max_q) * bar_width
+                else:
+                    bar_length = 0
+                bar_x = game.x_offset + single_frame_size_x - 70
+                bar_y = game.y_offset + single_frame_size_y - (idx + 1) * (bar_height + 5) - 20
+                color = COLOR_Q_VALUES[idx]
+                # Dessiner la barre
+                arcade.draw_rectangle_filled(
+                    bar_x + bar_length / 2,
+                    bar_y,
+                    abs(bar_length),
+                    bar_height,
+                    color
+                )
+                # Afficher le nom de l'action et la Q-valeur
+                arcade.draw_text(f"{actions[idx]}: {q:.2f}", bar_x - 60, bar_y - 5, COLOR_TEXT, 10)
+
+            # Indiquer l'action prévue
+            next_action = game.next_action
+            if next_action == 0:
+                action_text = "Tout droit"
+            elif next_action == 1:
+                action_text = "Tourner à droite"
+            else:
+                action_text = "Tourner à gauche"
+            arcade.draw_text(f"Action: {action_text}", game.x_offset + 10, game.y_offset + 10, COLOR_TEXT, 12)
 
         # Afficher la génération en haut au centre de la fenêtre
         arcade.draw_text(f"Génération: {self.generation}",
@@ -556,6 +667,56 @@ class SnakeAIApp(arcade.Window):
         arcade.draw_text(f"Meilleur Score: {self.best_score}",
                          self.width // 2, self.height - 60,
                          COLOR_TEXT, 16, anchor_x="center")
+
+    def clip_line_to_frame(self, x1, y1, x2, y2, x_offset, y_offset):
+        # Limiter la ligne aux limites du cadre du jeu
+        min_x = x_offset
+        max_x = x_offset + single_frame_size_x
+        min_y = y_offset
+        max_y = y_offset + single_frame_size_y
+
+        # Implémentation de l'algorithme de Liang-Barsky
+        p = [-(x2 - x1), x2 - x1, -(y2 - y1), y2 - y1]
+        q = [x1 - min_x, max_x - x1, y1 - min_y, max_y - y1]
+        u1 = 0.0
+        u2 = 1.0
+        for i in range(4):
+            if p[i] == 0:
+                if q[i] < 0:
+                    return x1, y1  # Trivialement hors limites
+            else:
+                t = q[i] / p[i]
+                if p[i] < 0:
+                    if t > u1:
+                        u1 = t
+                else:
+                    if t < u2:
+                        u2 = t
+        if u1 > u2:
+            return x1, y1  # Hors limites
+        x1_clip = x1 + u1 * (x2 - x1)
+        y1_clip = y1 + u1 * (y2 - y1)
+        x2_clip = x1 + u2 * (x2 - x1)
+        y2_clip = y1 + u2 * (y2 - y1)
+        return x2_clip, y2_clip
+
+    def draw_arrow(self, x_start, y_start, x_end, y_end, color):
+        # Dessiner une flèche pour indiquer la direction
+        arcade.draw_line(x_start, y_start, x_end, y_end, color, 2)
+        # Calculer le vecteur directionnel
+        dx = x_end - x_start
+        dy = y_end - y_start
+        angle = np.arctan2(dy, dx)
+        # Définir les pointes de la flèche
+        arrow_length = 10
+        angle1 = angle + np.pi / 6
+        angle2 = angle - np.pi / 6
+        x1 = x_end - arrow_length * np.cos(angle1)
+        y1 = y_end - arrow_length * np.sin(angle1)
+        x2 = x_end - arrow_length * np.cos(angle2)
+        y2 = y_end - arrow_length * np.sin(angle2)
+        # Dessiner les pointes de la flèche
+        arcade.draw_triangle_filled(x_end, y_end, x1, y1, x2, y2, color)
 
     def on_update(self, delta_time):
         # Jouer les parties
